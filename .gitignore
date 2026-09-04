@@ -7,3 +7,10 @@ venv/
 
 # local working files, not part of the repo's public history
 Progress-Tickets.md
+
+# generated output — the point is that it regenerates (spec §15)
+figures/*
+!figures/.gitkeep
+data/
+*.pt
+*.ckpt
