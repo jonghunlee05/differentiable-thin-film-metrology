@@ -539,6 +539,7 @@ differentiable-thin-film-metrology/
 ├── PROJECT_SPEC.md            this file
 ├── pyproject.toml             pinned dependencies
 ├── src/
+│   ├── fresnel.py             single-interface reference, numpy (§4.2)
 │   ├── tmm_torch.py           differentiable forward model
 │   ├── dispersion.py          Cauchy, Sellmeier, Lorentz; real n,k loaders
 │   ├── noise.py               §4.5 non-idealities
