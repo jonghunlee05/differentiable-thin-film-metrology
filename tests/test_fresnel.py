@@ -92,3 +92,64 @@ def test_no_nan_anywhere_in_a_full_sweep():
     for n_i, n_j in INDEX_PAIRS:
         r_s, r_p = fresnel_r(n_i, n_j, theta)
         assert np.all(np.isfinite(r_s)) and np.all(np.isfinite(r_p))
+
+
+# --- Brewster's angle, DTFM-007 --------------------------------------------
+#
+# Spec §4.2, §12 Week 0: the p-polarised reflection vanishes exactly at
+# tan θ_B = n_j / n_i. This is the sharpest check available on a single
+# interface — it pins the angular dependence, not just the θ=0 endpoint that
+# DTFM-006 tested, and it is a null, so it cannot be satisfied by a scale error.
+
+
+def brewster_angle(n_i: float, n_j: float) -> float:
+    """tan θ_B = n_j / n_i."""
+    return np.arctan2(n_j, n_i)
+
+
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_rp_vanishes_at_brewster_angle(n_i, n_j):
+    r_s, r_p = fresnel_r(n_i, n_j, brewster_angle(n_i, n_j))
+    assert abs(complex(r_p)) == pytest.approx(0.0, abs=1e-14)
+
+
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_rs_at_brewster_matches_its_closed_form(n_i, n_j):
+    """The null is p-only, and s has an exact value there.
+
+    Substituting θ_B into r_s collapses to (n_i² − n_j²)/(n_i² + n_j²). Asserting
+    that rather than merely "non-zero" avoids an arbitrary threshold — the
+    low-contrast pair 1.33→1.46 gives only 0.093, which any round-number cutoff
+    would either fail or be too loose to catch a swapped-polarisation bug.
+    """
+    expected = (n_i**2 - n_j**2) / (n_i**2 + n_j**2)
+    r_s, _ = fresnel_r(n_i, n_j, brewster_angle(n_i, n_j))
+
+    assert r_s.real == pytest.approx(expected, rel=1e-12)
+    assert abs(complex(r_s)) > 0.0
+
+
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_brewster_is_the_global_minimum_of_Rp(n_i, n_j):
+    """Locate the null numerically and confirm it sits where the physics says.
+
+    Stronger than evaluating at θ_B: a formula that happened to vanish at some
+    other angle would pass the point check and fail this one.
+    """
+    theta = np.linspace(0.0, np.pi / 2 - 1e-9, 20_001)
+    _, R_p = reflectance(n_i, n_j, theta)
+    assert theta[np.argmin(R_p)] == pytest.approx(brewster_angle(n_i, n_j), abs=1e-3)
+
+
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_rp_changes_sign_across_brewster(n_i, n_j):
+    """A true zero crossing, not a touch — r_p reverses phase through θ_B."""
+    theta_b = brewster_angle(n_i, n_j)
+    _, before = fresnel_r(n_i, n_j, theta_b - 0.05)
+    _, after = fresnel_r(n_i, n_j, theta_b + 0.05)
+    assert np.sign(before.real) == -np.sign(after.real)
+
+
+def test_brewster_angle_matches_textbook_value_for_air_to_glass():
+    """Air→crown glass: θ_B ≈ 55.6°, a number that can be checked by hand."""
+    assert np.degrees(brewster_angle(1.0, 1.46)) == pytest.approx(55.6, abs=0.1)
