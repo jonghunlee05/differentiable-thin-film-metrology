@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 .ipynb_checkpoints/
+
+# local working files, not part of the repo's public history
+Progress-Tickets.md
