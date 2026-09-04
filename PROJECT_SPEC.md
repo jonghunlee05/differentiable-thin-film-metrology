@@ -482,7 +482,7 @@ Moving cost from the second into the first is called **amortisation**, and it is
 Each phase ends with something committed, so stopping early still leaves a coherent project.
 
 ### Week 0 — ramp
-Repository, environment, `CLAUDE.md`. Fresnel at a single interface, validated against Brewster's angle (`tan θ_B = n₂/n₁`, where `r_p = 0` exactly). Rewrite in torch, verify identical numbers, take an autograd derivative and check against finite differences. Read Byrnes, *Multilayer optical calculations*.
+Repository, environment. Fresnel at a single interface, validated against Brewster's angle (`tan θ_B = n₂/n₁`, where `r_p = 0` exactly). Rewrite in torch, verify identical numbers, take an autograd derivative and check against finite differences. Read Byrnes, *Multilayer optical calculations*.
 **Ships:** validated single-interface model, ~5 commits.
 
 ### Weeks 1–2 — simulator
@@ -536,7 +536,6 @@ README opening with the calibration figure and three sentences. Package structur
 ```
 differentiable-thin-film-metrology/
 ├── README.md                  calibration figure, three sentences, how to run
-├── CLAUDE.md                  pointer to this spec, for AI-assisted sessions
 ├── PROJECT_SPEC.md            this file
 ├── pyproject.toml             pinned dependencies
 ├── src/
