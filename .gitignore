@@ -14,3 +14,10 @@ figures/*
 data/
 *.pt
 *.ckpt
+
+# build and test artefacts
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/

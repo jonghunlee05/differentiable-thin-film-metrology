@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "differentiable-thin-film-metrology"
+version = "0.1.0"
+description = "Physics-informed neural inversion of thin-film reflectance spectra, with calibrated uncertainty."
+readme = "PROJECT_SPEC.md"
+requires-python = ">=3.13,<3.15"
+
+# Pinned exactly, not bounded. Spec §15: reproducibility is a requirement,
+# not a nicety. Developed and verified on CPython 3.13.12.
+dependencies = [
+    "torch==2.14.0",
+    "numpy==2.5.2",
+    "scipy==1.18.1",
+    "matplotlib==3.11.1",
+]
+
+[project.optional-dependencies]
+# `tmm` is a validation-only dependency and must never be imported from src/.
+# Standing decision, spec §0.1: "write the forward model; import `tmm` only to
+# validate". Keeping it out of the runtime dependencies makes that structural
+# rather than a matter of discipline.
+dev = [
+    "pytest==9.1.1",
+    "tmm==0.2.0",
+    "ruff==0.15.4",
+]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
