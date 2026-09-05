@@ -37,6 +37,7 @@ __all__ = [
     "stack_cosines",
     "stack_matrix",
     "stack_r",
+    "spectra",
     "stack_reflectance",
 ]
 
@@ -400,3 +401,70 @@ def stack_reflectance(
     must stay differentiable.
     """
     return stack_r(wavelength, thicknesses, indices, theta_0, polarisation).abs() ** 2
+
+
+def spectra(
+    wavelengths: torch.Tensor,
+    thicknesses: torch.Tensor,
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float = 0.0,
+    polarisation: str = "s",
+) -> torch.Tensor:
+    """Reflectance spectra for a whole batch of films at once.
+
+    The training-loop entry point. §7.1 samples a batch of parameter vectors and
+    needs one spectrum per sample; computing them in a python loop would make the
+    simulator, not the network, the bottleneck.
+
+    ``stack_reflectance`` already broadcasts, so this adds no physics — it exists
+    to own the reshaping. Getting a batch axis to line up against a wavelength
+    axis by hand is a silent-failure risk: mismatched shapes broadcast into a
+    plausible result of the wrong meaning rather than raising, and the resulting
+    training data would be wrong in a way no test downstream would attribute here.
+
+    Parameters
+    ----------
+    wavelengths : shape ``(W,)``.
+    thicknesses : shape ``(B, L)`` — one row per film, one column per layer.
+        A 1-D tensor of shape ``(L,)`` is treated as a single film.
+    indices : ``L + 2`` entries, ambient first and substrate last. Each may be a
+        scalar, a spectrum of shape ``(W,)`` for a dispersive material (§4.4), or
+        shape ``(B, W)`` when the index itself is a fitted parameter.
+    theta_0 : angle of incidence in the ambient medium, radians.
+
+    Returns
+    -------
+    Reflectance of shape ``(B, W)``.
+    """
+    if thicknesses.ndim == 1:
+        thicknesses = thicknesses.unsqueeze(0)
+    if thicknesses.ndim != 2:
+        raise ValueError(
+            f"thicknesses must be (B, L) or (L,), got shape {tuple(thicknesses.shape)}"
+        )
+    if wavelengths.ndim != 1:
+        raise ValueError(f"wavelengths must be 1-D of shape (W,), got {tuple(wavelengths.shape)}")
+
+    n_layers = thicknesses.shape[1]
+    if len(indices) != n_layers + 2:
+        raise ValueError(
+            f"got {len(indices)} indices for {n_layers} layers; expected {n_layers + 2} "
+            "(ambient, each layer, substrate)."
+        )
+
+    # Batch on axis 0, wavelength on axis 1. Layer thicknesses do not vary with
+    # wavelength, and an index that is already (B, W) is left alone.
+    per_layer = [thicknesses[:, k : k + 1] for k in range(n_layers)]
+    lam = wavelengths.reshape(1, -1)
+    broadcast_indices = [
+        n if isinstance(n, torch.Tensor) and n.ndim == 2 else _as_row(n) for n in indices
+    ]
+
+    return stack_reflectance(lam, per_layer, broadcast_indices, theta_0, polarisation)
+
+
+def _as_row(n: torch.Tensor | float) -> torch.Tensor | float:
+    """Reshape a per-wavelength index to ``(1, W)``; leave scalars untouched."""
+    if isinstance(n, torch.Tensor) and n.ndim == 1:
+        return n.reshape(1, -1)
+    return n

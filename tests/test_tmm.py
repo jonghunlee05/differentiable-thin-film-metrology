@@ -600,3 +600,93 @@ def test_layer_count_mismatch_is_rejected():
 
     with pytest.raises(ValueError, match="at least an ambient"):
         pt.stack_reflectance(WAVELENGTH, [], [1.0], 0.0, "s")
+
+
+# --- batching, DTFM-013 -----------------------------------------------------
+#
+# Spec §7.1. The training loop samples a batch of parameter vectors and needs
+# one spectrum each. The forward model is called once per training step forever,
+# so a python loop here would make the simulator the bottleneck rather than the
+# network — and §11 calls moving cost out of the inference loop the entire
+# industrial argument for the project.
+
+
+def test_batched_spectra_match_a_loop_over_single_calls():
+    """The acceptance criterion. Broadcasting must not change any answer."""
+    wavelengths = SPECTRUM
+    thicknesses = torch.tensor([[120.0, 65.0], [300.0, 40.0], [55.0, 210.0], [480.0, 90.0]])
+    indices = [1.0, 1.46, 2.3, 3.88]
+
+    for pol in POLARISATIONS:
+        for angle in (0.0, 0.7):
+            batched = pt.spectra(wavelengths, thicknesses, indices, angle, pol)
+            looped = torch.stack([
+                pt.stack_reflectance(wavelengths, [row[0], row[1]], indices, angle, pol)
+                for row in thicknesses
+            ])
+            assert batched.shape == (thicknesses.shape[0], wavelengths.numel())
+            assert torch.allclose(batched, looped, atol=1e-14)
+
+
+def test_batching_handles_a_dispersive_index():
+    """§4.4 supplies n(λ), so an index may be a spectrum rather than a scalar."""
+    wavelengths = SPECTRUM
+    n_film = 1.45 + 0.02 * (wavelengths - 600.0) / 200.0
+    thicknesses = torch.tensor([[120.0], [340.0]])
+
+    batched = pt.spectra(wavelengths, thicknesses, [1.0, n_film, 3.88])
+    looped = torch.stack([
+        pt.stack_reflectance(wavelengths, [row[0]], [1.0, n_film, 3.88]) for row in thicknesses
+    ])
+
+    assert torch.allclose(batched, looped, atol=1e-14)
+
+
+def test_batching_handles_a_per_sample_index():
+    """The index is itself a fitted parameter (§5.1), so it varies across a batch."""
+    wavelengths = SPECTRUM
+    thicknesses = torch.tensor([[120.0], [120.0], [120.0]])
+    n_film = torch.tensor([1.40, 1.46, 1.52]).unsqueeze(-1).expand(3, wavelengths.numel())
+
+    batched = pt.spectra(wavelengths, thicknesses, [1.0, n_film, 3.88])
+
+    assert batched.shape == (3, wavelengths.numel())
+    # Different indices must give different spectra, or the parameter is being ignored.
+    assert not torch.allclose(batched[0], batched[1], atol=1e-6)
+    assert not torch.allclose(batched[1], batched[2], atol=1e-6)
+
+
+def test_a_single_film_may_be_passed_unbatched():
+    one = pt.spectra(SPECTRUM, torch.tensor([120.0, 65.0]), [1.0, 1.46, 2.3, 3.88])
+    assert one.shape == (1, SPECTRUM.numel())
+
+
+def test_batched_gradients_match_per_sample_gradients():
+    """The acceptance criterion's third clause, stated strictly.
+
+    §7.3 backpropagates the reconstruction loss through a batch. It is not
+    enough that gradients are finite: each row's gradient must equal what that
+    film would have got alone, or the batch axis is leaking between samples.
+    """
+    thicknesses = torch.tensor([[120.0], [340.0], [55.0]], dtype=torch.float64,
+                               requires_grad=True)
+    pt.spectra(SPECTRUM, thicknesses, [1.0, 1.46, 3.88]).sum().backward()
+
+    for i, d in enumerate([120.0, 340.0, 55.0]):
+        single = torch.tensor(d, dtype=torch.float64, requires_grad=True)
+        pt.stack_reflectance(SPECTRUM, [single], [1.0, 1.46, 3.88]).sum().backward()
+        assert thicknesses.grad[i, 0].item() == pytest.approx(single.grad.item(), rel=1e-12)
+
+
+def test_batch_shape_errors_are_rejected():
+    """Mismatched axes broadcast into a plausible wrong answer rather than
+    raising, so the shapes are checked rather than trusted.
+    """
+    with pytest.raises(ValueError, match="expected 4"):
+        pt.spectra(SPECTRUM, torch.tensor([[120.0, 65.0]]), [1.0, 1.46, 3.88])
+
+    with pytest.raises(ValueError, match="wavelengths must be 1-D"):
+        pt.spectra(SPECTRUM.reshape(1, -1), torch.tensor([[120.0]]), [1.0, 1.46, 3.88])
+
+    with pytest.raises(ValueError, match=r"thicknesses must be"):
+        pt.spectra(SPECTRUM, torch.zeros(2, 2, 2), [1.0, 1.46, 3.88])
