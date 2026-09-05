@@ -31,7 +31,17 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-__all__ = ["cos_theta_t", "fresnel_r", "reflectance"]
+__all__ = ["cos_theta_t", "fresnel_r", "is_forward", "reflectance"]
+
+
+def is_forward(n_j: ArrayLike, cos_j: ArrayLike) -> NDArray[np.bool_]:
+    """Whether ``cos_j`` is the root describing a wave that decays as it travels.
+
+    The transmitted wave carries ``exp(i·(2π/λ)·ñ_j·d·cosθ_j)``, whose magnitude
+    is ``exp(−(2π/λ)·d·Im(ñ_j cosθ_j))``. So it decays exactly when
+    ``Im(ñ_j cosθ_j) ≥ 0``, and grows when that is negative.
+    """
+    return np.imag(np.asarray(n_j) * np.asarray(cos_j)) >= 0.0
 
 
 def cos_theta_t(n_i: ArrayLike, n_j: ArrayLike, theta_i: ArrayLike) -> NDArray[np.complexfloating]:
@@ -43,14 +53,30 @@ def cos_theta_t(n_i: ArrayLike, n_j: ArrayLike, theta_i: ArrayLike) -> NDArray[n
     rather than ``numpy.sqrt`` keeps that case exact instead of returning a
     silent ``nan`` in the middle of an array.
 
+    For absorbing media the root must additionally be chosen so the transmitted
+    wave decays rather than grows; see :func:`is_forward` and the discussion in
+    ``src.tmm_torch.cos_theta_t``. The selection is duplicated here rather than
+    shared, deliberately: this module exists to be an independent check on the
+    torch model, and a shared helper would make the two agree by construction.
+
     Parameters
     ----------
-    n_i, n_j : refractive index of the incident and transmitted media.
+    n_i, n_j : refractive index of the incident and transmitted media. Absorbing
+        media are written ``n + ik`` with ``k >= 0``.
     theta_i : angle of incidence, in radians, measured from the surface normal.
     """
     n_i, n_j, theta_i = np.asarray(n_i), np.asarray(n_j), np.asarray(theta_i)
     sin_theta_t = (n_i / n_j) * np.sin(theta_i)
-    return np.emath.sqrt(1.0 - sin_theta_t**2)
+    cos_j = np.emath.sqrt(1.0 - sin_theta_t**2)
+
+    cos_j = np.where(is_forward(n_j, cos_j), cos_j, -cos_j)
+
+    if not np.all(is_forward(n_j, cos_j)):
+        raise AssertionError(
+            "branch-cut selection failed: Im(n_j·cosθ_j) < 0 after root selection, "
+            "which describes a medium amplifying the light passing through it."
+        )
+    return cos_j
 
 
 def fresnel_r(
