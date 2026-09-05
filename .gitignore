@@ -12,7 +12,12 @@ Failures.md
 # generated output — the point is that it regenerates (spec §15)
 figures/*
 !figures/.gitkeep
-data/
+# Generated data is excluded by its contents rather than by the directory: git
+# cannot re-include anything beneath an excluded directory, and the vendored
+# optical constants below need exactly that exception. They cannot be
+# regenerated, and §4.4 requires real n,k rather than invented coefficients.
+data/*
+!data/refractiveindex/
 *.pt
 *.ckpt
 

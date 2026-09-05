@@ -562,6 +562,9 @@ differentiable-thin-film-metrology/
 │   ├── 03_training.ipynb
 │   └── 04_calibration_and_failure.ipynb
 ├── configs/
+├── data/
+│   └── refractiveindex/       vendored n,k with provenance (§4.4); CC0
+├── scripts/
 ├── figures/
 └── report.md
 ```
