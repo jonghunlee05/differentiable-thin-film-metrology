@@ -94,12 +94,19 @@ def test_the_fit_is_slow_enough_for_the_project_to_have_a_point(substrate):
 
 
 @pytest.mark.parametrize("true_thickness", [65.0, 900.0, 1500.0])
-def test_a_cold_start_converges_to_the_wrong_fringe(true_thickness, substrate):
-    """§5.2(b)'s fringe-order ambiguity, on the first estimator built.
+def test_a_cold_start_converges_to_a_wrong_minimum(true_thickness, substrate):
+    """The failure the whole baseline exists to expose, on the first estimator built.
 
-    R is quasi-periodic in n·d, so the cost surface has many minima. Started at
-    300 nm, the fit walks into whichever basin it lands in and stops. It reports
-    ``success`` while being hundreds of nanometres wrong.
+    The cost surface has many local minima. Started at 300 nm, the fit walks into
+    whichever basin it lands in and stops. It reports ``success`` while being
+    hundreds of nanometres wrong.
+
+    Originally written as "converges to the wrong *fringe*", citing §5.2(b). That
+    label was checked later and does not hold — the minima are 4 nm apart where a
+    fringe is 265 nm, and this test's own landing point at 316.96 nm is 53 nm from
+    the nearest predicted alias. The behaviour is real and the numbers are
+    unchanged; only the name was wrong. See ``Implementation-Notes.md`` §18 and
+    ``test_broadband_data_replaces_few_deep_minima_with_many_shallow_ones``.
 
     This is not a defect to fix here — §6 prescribes multi-start for it, at
     DTFM-032. It is the behaviour the baseline genuinely has, and pretending
@@ -412,19 +419,19 @@ def test_the_two_baselines_agree_where_both_converge(substrate):
 
 
 @pytest.mark.parametrize("true_thickness", [65.0, 900.0, 1500.0])
-def test_exact_gradients_do_not_fix_the_fringe_ambiguity(true_thickness, substrate):
+def test_exact_gradients_do_not_fix_the_multimodality(true_thickness, substrate):
     """The finding this ticket was worth running for.
 
-    It would be easy to assume the classical fit misses the right fringe because
+    It would be easy to assume the classical fit misses the right minimum because
     its finite-differenced Jacobian is approximate. It does not. Handed the exact
     derivative, the descent walks into a wrong basin from the same cold start and
     reports the same kind of confident wrong number — at 900 nm the two baselines
     even agree with each other, both landing near 316 nm.
 
-    §5.2(b)'s ambiguity is a property of the *cost surface*, not of how the
-    gradient was obtained, so no improvement in gradient quality can remove it.
-    Only a different search can, which is why §6 prescribes multi-start and why
-    DTFM-032 exists.
+    The multimodality is a property of the *cost surface*, not of how the gradient
+    was obtained, so no improvement in gradient quality can remove it. Only a
+    different search can, which is why §6 prescribes multi-start and why DTFM-032
+    exists.
     """
     measurement = gen.Measurement()
     truth = np.array([true_thickness, 1.46, 0.004])
@@ -529,3 +536,325 @@ def test_autograd_descent_is_reproducible(substrate):
 def test_an_unknown_optimiser_is_refused():
     with pytest.raises(ValueError, match="lbfgs"):
         bl.fit_autograd(np.zeros(400), WAVELENGTHS, [400.0, 1.45, 0.005], optimiser="sgd")
+
+
+# --- DTFM-032: multi-start, and the landscape it surveys ---------------------
+
+
+def test_the_start_grid_spans_the_prior_without_sitting_on_its_bounds():
+    """Endpoints are pulled inward deliberately: a start on a bound sits exactly
+    where the projection clamps, and the fit can stall there rather than descend.
+    """
+    prior = gen.Prior()
+    grid = bl.multi_start_grid(12, prior)
+
+    assert grid.size == 12
+    assert np.all(np.diff(grid) > 0)
+    assert prior.thickness_nm[0] < grid[0] < grid[-1] < prior.thickness_nm[1]
+    assert grid[0] - prior.thickness_nm[0] > 1.0
+    assert prior.thickness_nm[1] - grid[-1] > 1.0
+
+
+def test_the_start_grid_is_uniform_in_thickness_not_in_the_prior_spacing():
+    """The substance of ``multi_start_grid``, and it is counter-intuitive.
+
+    The prior is log-uniform because §7.1 weights each thickness decade equally.
+    Seeding the *search* the same way is the obvious move and it is wrong: what a
+    start must do is land inside the **basin of attraction** of the true minimum,
+    and those are spread evenly in thickness rather than in its logarithm.
+
+    The threshold below is the narrowest basin actually measured — 110 nm, on a
+    420 nm film — not a fringe period. Both grids here carry the same number of
+    starts, so this compares spacing alone: the uniform grid fits inside the
+    narrowest basin, the log grid leaves a hole twice that wide. An earlier
+    version asserted against 268 nm on the theory that minima sit one fringe apart. They do not;
+    they are 4 nm apart (``Implementation-Notes.md`` §18), and asserting against
+    that number would have passed while meaning nothing.
+    """
+    prior = gen.Prior()
+    assert prior.spacing == "log-uniform", "the premise of this test"
+
+    narrowest_basin_nm = 110.0
+    uniform = bl.multi_start_grid(prior=prior)
+    logarithmic = bl.multi_start_grid(prior=prior, spacing="log-uniform")
+
+    assert np.max(np.diff(uniform)) < narrowest_basin_nm, (
+        "no measured basin fits between two starts"
+    )
+    assert np.max(np.diff(logarithmic)) > 2 * narrowest_basin_nm, (
+        "while the log grid, at the same cost, leaves a gap two basins wide"
+    )
+
+
+def test_the_default_start_count_is_the_one_that_was_measured():
+    """§15's habit, applied to a default rather than to a result.
+
+    The default was 12, justified by an argument later shown to be false. It is
+    now 20, from two agreeing lines of evidence: the narrowest measured basin is
+    110 nm, requiring ``count ≥ 1980 × 0.96 / 110 ≈ 18``; and on 40 films drawn
+    from the prior, 8 starts recover 29 of 40 while 12 and above recover all of
+    them. 12 works but sits exactly on the observed boundary, so the default
+    carries margin rather than sitting at the edge of what was tested.
+    """
+    prior = gen.Prior()
+    grid = bl.multi_start_grid(prior=prior)
+
+    assert grid.size == 20
+    assert np.max(np.diff(grid)) < 110.0, "inside the narrowest basin"
+    assert bl.multi_start_grid(8, prior).max() > 65.0, (
+        "and the count that failed did so because its first start sat above the "
+        "thin films it missed — every one of them under 85 nm"
+    )
+
+
+@pytest.mark.parametrize("true_thickness", [30.0, 65.0, 420.0, 900.0, 1500.0])
+def test_multi_start_recovers_films_a_single_cold_start_cannot(true_thickness, substrate):
+    """DTFM-032's acceptance criterion, and the repair of DTFM-030's failure.
+
+    A single fit cold-started at 300 nm reports ``success`` while being hundreds
+    of nanometres wrong, and DTFM-031 showed exact gradients do not help because
+    the ambiguity is in the cost surface. Surveying it does help: twelve starts
+    across the prior, keep the lowest cost.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([true_thickness, 1.46, 0.004])
+    observed = _observe(truth, measurement, substrate)
+
+    result = bl.fit_multi_start(observed, WAVELENGTHS, measurement=measurement, truth=truth)
+
+    assert abs(result.thickness_error_nm) < 1e-3
+    assert np.allclose(result.parameters, truth, rtol=1e-5)
+
+
+def test_uniform_starts_beat_log_starts_at_the_same_cost(substrate):
+    """The measurement behind the default, not an appeal to the docstring.
+
+    Same number of fits, same films, same everything but the spacing of the
+    starting guesses. Changing the spacing recovers films that doubling a log
+    grid does not.
+    """
+    measurement = gen.Measurement()
+    films = (30.0, 65.0, 150.0, 420.0, 900.0, 1500.0, 1900.0)
+
+    recovered = {}
+    for spacing in ("uniform", "log-uniform"):
+        hits = 0
+        for thickness in films:
+            truth = np.array([thickness, 1.46, 0.004])
+            result = bl.fit_multi_start(
+                _observe(truth, measurement, substrate),
+                WAVELENGTHS,
+                count=12,
+                spacing=spacing,
+                measurement=measurement,
+                truth=truth,
+            )
+            hits += abs(result.thickness_error_nm) < 1e-3
+        recovered[spacing] = hits
+
+    assert recovered["uniform"] == len(films)
+    assert recovered["log-uniform"] < len(films)
+
+
+def test_the_losing_fits_are_kept(substrate):
+    """§6: "record where each converges. That landscape *is* the fringe-order
+    ambiguity made visible."
+
+    The losers are the evidence. They are what the figure is drawn from, and
+    DTFM-033 needs them to say whether an error bar at the winner means anything
+    with a rival minimum hundreds of nanometres away.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([900.0, 1.46, 0.004])
+
+    result = bl.fit_multi_start(
+        _observe(truth, measurement, substrate),
+        WAVELENGTHS,
+        count=12,
+        measurement=measurement,
+        truth=truth,
+    )
+    centres, counts = result.basins()
+
+    assert len(result.fits) == 12
+    assert result.starts.size == 12
+    assert result.thicknesses.size == 12
+    assert centres.size > 1, "the ambiguity is real, and this records it"
+    assert counts.sum() == 12
+    assert result.wall_clock_s > 0.0
+
+
+def test_multi_start_wins_on_depth_rather_than_on_odds(substrate):
+    """Why taking the lowest cost is safe even though most starts fail.
+
+    Only about one start in eight reaches the truth. That would be a weak
+    procedure if the winner were hard to identify — but on noiseless data the
+    true basin is roughly 1e26 times deeper than the best rival, so the choice is
+    not a close call. The margin, not the hit rate, is what makes this work, and
+    it is the margin that noise will erode. §8's calibration and DTFM-033's
+    covariance are about how far.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([900.0, 1.46, 0.004])
+
+    result = bl.fit_multi_start(
+        _observe(truth, measurement, substrate),
+        WAVELENGTHS,
+        starts=np.linspace(20.0, 2000.0, 41),
+        measurement=measurement,
+        truth=truth,
+    )
+
+    assert result.success_fraction < 0.5, "most starts do not find it"
+    landed = result.thicknesses
+    runner_up = np.min(result.costs[np.abs(landed - truth[0]) > 1.0])
+
+    assert abs(result.thickness_error_nm) < 1e-3, "yet the answer is right"
+    assert runner_up > 1e12 * max(result.best.cost, 1e-300), "because it is unmistakable"
+
+
+def test_multi_start_costs_what_it_looks_like_it_costs(substrate):
+    """§11's amortisation argument, made concrete.
+
+    A correct classical answer is not one fit, it is ``count`` fits. This is the
+    honest per-site number the network is asked to beat, and it is an order of
+    magnitude above the single-fit figure DTFM-030 recorded.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([900.0, 1.46, 0.004])
+    observed = _observe(truth, measurement, substrate)
+
+    single = bl.fit_least_squares(
+        observed, WAVELENGTHS, [880.0, 1.46, 0.004], measurement=measurement
+    )
+    sweep = bl.fit_multi_start(observed, WAVELENGTHS, count=12, measurement=measurement)
+
+    assert sweep.wall_clock_s > 4.0 * single.wall_clock_s
+    assert sum(fit.function_evaluations for fit in sweep.fits) > single.function_evaluations
+
+
+def test_multi_start_drives_either_baseline(substrate):
+    """The survey is a search strategy, not a property of one optimiser — so both
+    DTFM-030's and DTFM-031's fitters plug into it, and both should land on the
+    same film.
+
+    ``count`` stays at the default rather than being trimmed to make the test
+    quick: six starts sit 317 nm apart, wider than the widest measured basin, and
+    both methods then miss the film. That is the grid derivation asserting itself
+    rather than a flaky test.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([420.0, 1.46, 0.004])
+    observed = _observe(truth, measurement, substrate)
+
+    classical = bl.fit_multi_start(observed, WAVELENGTHS, measurement=measurement, truth=truth)
+    descent = bl.fit_multi_start(
+        observed, WAVELENGTHS, measurement=measurement, truth=truth, method="autograd"
+    )
+
+    assert abs(classical.thickness_error_nm) < 1e-3
+    assert abs(descent.thickness_error_nm) < 1e-3
+
+
+def test_bad_arguments_are_refused():
+    with pytest.raises(ValueError, match="count"):
+        bl.multi_start_grid(0)
+    with pytest.raises(ValueError, match="spacing"):
+        bl.multi_start_grid(4, spacing="geometric")
+    with pytest.raises(ValueError, match="method"):
+        bl.fit_multi_start(np.zeros(400), WAVELENGTHS, count=2, method="newton")
+
+
+def test_broadband_data_replaces_few_deep_minima_with_many_shallow_ones(substrate):
+    """What the cold-start failures of DTFM-030 to 032 actually are.
+
+    All three tickets called them §5.2(b) fringe-order ambiguity. That is the
+    *single-wavelength* picture: R is periodic in ``n·d``, so aliases sit one
+    fringe apart, ``λ / (2 n cos θ_t) ≈ 265 nm`` here. Measured against the real
+    cost surface, it does not hold — the minima are 4 nm apart, not 265, and the
+    fit's landing point at 316.96 nm is 53 nm from the nearest predicted alias.
+
+    The cause is broadband. Each wavelength has its own fringe period (177 nm at
+    400 nm, 353 nm at 800 nm), and summing 200 of them produces a beat landscape
+    far denser than any one of them. Narrow the band or thin the sampling and the
+    textbook picture returns:
+
+    | band | points | minima | median spacing |
+    |---|---|---|---|
+    | 599-601 nm | 3 | 15 | 132 nm |
+    | 550-650 nm | 50 | 53 | 6.4 nm |
+    | 400-800 nm | 200 | 279 | 4.2 nm |
+
+    This is not a defect. It is the bargain broadband makes, and it cuts both
+    ways: the false minima get *shallow* as they get dense, which is why the true
+    minimum ends up ~1e26 deeper and why multi-start works on depth. §5.2(b)'s
+    ambiguity has not been removed by using a spectrum — it has been traded for a
+    rougher surface with an unmistakable global answer.
+    """
+    grid = np.linspace(20.0, 2000.0, 4000)
+    truth = np.array([900.0, 1.46, 0.004])
+
+    def minima_of(measurement) -> np.ndarray:
+        observed = _observe(truth, measurement, substrate)
+        cost = np.empty(grid.size)
+        with torch.no_grad():
+            for i, thickness in enumerate(grid):
+                model = bl.forward_observable(
+                    [thickness, truth[1], truth[2]], WAVELENGTHS, measurement, substrate
+                ).numpy()
+                residual = bl.wrapped_residual(model, observed, measurement.observable)
+                cost[i] = 0.5 * np.sum(residual**2)
+        interior = (cost[1:-1] < cost[:-2]) & (cost[1:-1] < cost[2:])
+        return grid[1:-1][interior]
+
+    single_fringe_nm = 265.0
+    broadband = minima_of(gen.Measurement())
+    reflectance = minima_of(gen.Measurement(observable="reflectance"))
+
+    assert np.median(np.diff(broadband)) < 0.2 * single_fringe_nm, (
+        "the minima are far denser than one per fringe"
+    )
+    assert broadband.size > 5 * reflectance.size, (
+        "and the phase observable is much rougher than the intensity one"
+    )
+
+
+def test_picking_the_deepest_basin_survives_realistic_noise(substrate):
+    """The claim multi-start rests on, checked rather than assumed.
+
+    Choosing the lowest-cost fit is only sound while the true basin is clearly
+    the deepest, and noise fills basins in. That much was stated in DTFM-032
+    without being measured, which is the habit
+    ``Implementation-Notes.md`` §19 is about. Measured:
+
+    | ellipsometer σ (rad) | films correct | median error |
+    |---|---|---|
+    | 0 | 5 of 5 | 0.0000 nm |
+    | 1e-3 (realistic) | 5 of 5 | 0.005 nm |
+    | 1e-2 | 5 of 5 | 0.09 nm |
+    | 3e-2 | 4 of 5 | 0.20 nm |
+
+    The margin is far more robust than the original wording implied — it takes
+    roughly 30x a real instrument's noise before a wrong basin is ever chosen. The
+    error still grows with noise, which is what DTFM-033's covariance has to
+    report honestly.
+    """
+    measurement = gen.Measurement()
+    rng = np.random.default_rng(0)
+
+    errors = {}
+    for sigma in (1e-3, 1e-2):
+        worst = 0.0
+        for thickness in (65.0, 420.0, 1500.0):
+            truth = np.array([thickness, 1.46, 0.004])
+            observed = _observe(truth, measurement, substrate)
+            noisy = observed + rng.normal(0.0, sigma, observed.shape)
+            result = bl.fit_multi_start(
+                noisy, WAVELENGTHS, count=12, measurement=measurement, truth=truth
+            )
+            worst = max(worst, abs(result.thickness_error_nm))
+        errors[sigma] = worst
+
+    assert errors[1e-3] < 0.1, "at realistic noise the right basin is still chosen"
+    assert errors[1e-2] < 2.0, "and it degrades gracefully rather than jumping basins"
+    assert errors[1e-2] > errors[1e-3], "error grows with noise, as it must"

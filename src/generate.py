@@ -59,6 +59,14 @@ class Measurement:
 
     ``reflectance`` is retained rather than removed. §10 wants both, and the
     comparison is the evidence for the decision.
+
+    **The decision stands; its accounting was incomplete.** DTFM-028 measured the
+    information and never the cost surface. DTFM-032 measured the surface, and the
+    same choice makes it far harder to search: for a 900 nm film the thickness
+    slice carries 279 local minima under ellipsometry against 12 under
+    reflectance, 4 nm apart rather than 145 nm. Better information, harder to
+    reach — which is why multi-start is not optional here. See
+    ``Implementation-Notes.md`` §18.
     """
 
     angle_deg: float = 70.0
@@ -305,6 +313,7 @@ def generate_batch(
             )
             observed[i] = np.concatenate([noisy_psi, noisy_delta])
         else:
+
             def forward(grid_nm, thickness, _n=film_index, _c=per_film):
                 layers, media = _c.stack_with_defects([float(thickness)], [1.0, _n, substrate])
                 return pt.stack_reflectance(
