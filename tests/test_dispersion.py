@@ -195,3 +195,146 @@ def test_dispersion_changes_the_spectrum_enough_to_matter():
     )
 
     assert (dispersive - constant).abs().max().item() > 0.01
+
+
+# --- Cauchy dispersion, DTFM-020 -------------------------------------------
+#
+# Spec §4.4. The model is fitted to the measured data of DTFM-019 rather than
+# given invented coefficients, and the fit is only meaningful where the material
+# is transparent — the validity condition §4.4 calls interview-defensible
+# physics, and which the tests below establish quantitatively rather than assert.
+
+TRANSPARENT = ["SiO2", "Si3N4"]
+
+
+@pytest.mark.parametrize("material", TRANSPARENT)
+def test_cauchy_fits_transparent_materials_closely(material):
+    """The acceptance criterion: residuals reported, and small.
+
+    1e-4 in refractive index is far below what any spectrometer resolves, so a
+    Cauchy model is a faithful stand-in for the tabulated data over the visible.
+    """
+    fit = dp.fit_cauchy(material)
+
+    assert fit.rms_residual < 2e-4
+    assert fit.max_residual < 1e-3
+    assert fit.range_nm == (400.0, 800.0)
+
+
+@pytest.mark.parametrize("material", TRANSPARENT)
+def test_the_third_term_earns_its_place(material):
+    """C/λ⁴ must actually improve the fit, or it is a free parameter for nothing.
+
+    §6 asks the same question formally with AIC/BIC at DTFM-035 — whether the
+    data justifies an extra parameter. This is the cheap version of it.
+    """
+    two = dp.fit_cauchy(material, terms=2)
+    three = dp.fit_cauchy(material, terms=3)
+
+    assert three.rms_residual < two.rms_residual
+    assert two.c == 0.0
+
+
+@pytest.mark.parametrize("material", ["SiO2", "Si3N4", "TiO2"])
+def test_coefficients_describe_normal_dispersion(material):
+    """A > 1 and B > 0 — anything else is not a transparent dielectric.
+
+    B > 0 is what makes n fall with wavelength, which §5.2(a) relies on: without
+    dispersion a spectrum constrains only the product n·d, and thickness and
+    index would be perfectly degenerate.
+    """
+    fit = dp.fit_cauchy(material)
+
+    assert fit.a > 1.0
+    assert fit.b > 0.0
+
+
+@pytest.mark.parametrize("material", TRANSPARENT)
+def test_the_fitted_model_reproduces_the_data_it_was_fitted_to(material):
+    wavelengths = np.linspace(420.0, 780.0, 73)
+    fit = dp.fit_cauchy(material, wavelengths)
+    n_data, _ = dp.load_nk(material, wavelengths)
+
+    assert np.allclose(dp.cauchy_n(fit, wavelengths), n_data, atol=1e-3)
+
+
+def test_absorbing_materials_are_refused_by_default():
+    """Cauchy has no imaginary part, so fitting an absorber is a wrong model
+    rather than a poor fit — silicon's k reaches 0.386 across the visible.
+    """
+    with pytest.raises(ValueError, match="below the absorption edge"):
+        dp.fit_cauchy("Si")
+
+    forced = dp.fit_cauchy("Si", allow_absorbing=True)
+    assert forced.rms_residual > 100 * dp.fit_cauchy("SiO2").rms_residual
+
+
+def test_fit_quality_degrades_approaching_the_absorption_edge():
+    """The headline physics of §4.4, measured rather than asserted.
+
+    Cauchy is the leading terms of a Sellmeier form expanded far from resonance.
+    Approach the absorption edge and that expansion diverges, so the residual
+    must grow monotonically as the fit range closes on it — while the fitted
+    curve still *looks* like a dispersion curve, which is why the residual is
+    the thing to watch rather than the plot.
+
+    TiO₂ is the clean case: its edge sits at ~395 nm, inside the measured range.
+    """
+    starts = [700.0, 600.0, 500.0, 450.0, 420.0, 405.0]
+    residuals = [
+        dp.fit_cauchy("TiO2", np.linspace(start, 800.0, 200)).rms_residual for start in starts
+    ]
+
+    assert all(b > a for a, b in zip(residuals, residuals[1:], strict=False))
+    assert residuals[-1] > 500 * residuals[0]
+
+
+def test_titania_far_from_its_edge_fits_as_well_as_a_transparent_material():
+    """The converse of the test above: the model is not simply bad for TiO₂.
+
+    Given room from the absorption edge it fits to 2e-6 — better than SiO₂ over
+    the visible. The limitation is the edge, not the material.
+    """
+    fit = dp.fit_cauchy("TiO2", np.linspace(700.0, 800.0, 200))
+    assert fit.rms_residual < 1e-5
+
+
+def test_the_model_is_differentiable_in_its_coefficients():
+    """§7.1 samples dispersion coefficients as parameters and §7.3
+    backpropagates through them, so the model must survive autograd.
+    """
+    fit = dp.fit_cauchy("SiO2")
+    coefficients = torch.tensor([fit.a, fit.b, fit.c], dtype=torch.float64, requires_grad=True)
+    wavelengths = torch.linspace(450.0, 750.0, 50, dtype=torch.float64)
+
+    dp.cauchy_n(coefficients, wavelengths).sum().backward()
+
+    assert torch.all(torch.isfinite(coefficients.grad))
+    assert torch.all(coefficients.grad > 0.0)
+
+
+def test_a_cauchy_film_drives_the_forward_model():
+    """End to end: fitted coefficients through the stack, differentiably.
+
+    This is the shape §7.1 will use — a film described by dispersion parameters
+    rather than a fixed index, with gradients reaching those parameters.
+    """
+    fit = dp.fit_cauchy("SiO2")
+    coefficients = torch.tensor([fit.a, fit.b, fit.c], dtype=torch.float64, requires_grad=True)
+    wavelengths = torch.linspace(450.0, 800.0, 120, dtype=torch.float64)
+
+    n_film = dp.cauchy_n(coefficients, wavelengths)
+    n_sub, k_sub = dp.load_nk("Si", wavelengths.numpy())
+    substrate = torch.tensor(n_sub + 1j * k_sub)
+
+    R = pt.stack_reflectance(wavelengths, [500.0], [1.0, n_film, substrate], 0.0, "s")
+    R.sum().backward()
+
+    assert torch.all((R >= 0.0) & (R <= 1.0))
+    assert torch.all(torch.isfinite(coefficients.grad))
+    assert torch.any(coefficients.grad != 0.0)
+
+
+def test_invalid_term_count_is_rejected():
+    with pytest.raises(ValueError, match="terms must be 2 or 3"):
+        dp.fit_cauchy("SiO2", terms=4)

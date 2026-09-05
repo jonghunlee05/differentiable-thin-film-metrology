@@ -21,7 +21,15 @@ import numpy as np
 import yaml
 from numpy.typing import NDArray
 
-__all__ = ["MATERIALS", "available_materials", "load_nk", "material_range_nm"]
+__all__ = [
+    "MATERIALS",
+    "CauchyFit",
+    "available_materials",
+    "cauchy_n",
+    "fit_cauchy",
+    "load_nk",
+    "material_range_nm",
+]
 
 _DATA_ROOT = pathlib.Path(__file__).resolve().parent.parent / "data" / "refractiveindex"
 
@@ -158,3 +166,141 @@ def load_nk(
         k = np.interp(wavelength_um, table[:, 0], table[:, 2])
 
     return np.asarray(n, dtype=float), np.asarray(k, dtype=float)
+
+
+# --- Cauchy dispersion, DTFM-020 -------------------------------------------
+
+
+@dataclass(frozen=True)
+class CauchyFit:
+    """A Cauchy model fitted to measured data, with the residuals that justify it.
+
+    Coefficients follow the usual convention with **wavelength in micrometres**,
+    so ``A`` is dimensionless, ``B`` is µm² and ``C`` is µm⁴ — the form the
+    coefficients are quoted in throughout the literature, which makes them
+    comparable to published values rather than only to themselves.
+    """
+
+    a: float
+    b: float
+    c: float
+    rms_residual: float
+    max_residual: float
+    range_nm: tuple[float, float]
+    max_k_in_range: float
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        return (
+            f"n(λ) = {self.a:.5f} + {self.b:.5f}/λ² + {self.c:.5f}/λ⁴  (λ in µm), "
+            f"rms {self.rms_residual:.2e} over {self.range_nm[0]:.0f}-{self.range_nm[1]:.0f} nm"
+        )
+
+
+def cauchy_n(coefficients, wavelengths_nm):
+    """Evaluate ``n(λ) = A + B/λ² + C/λ⁴``.
+
+    Parameters
+    ----------
+    coefficients : a :class:`CauchyFit`, or any ``(A, B, C)`` sequence — including
+        torch tensors carrying ``requires_grad``.
+    wavelengths_nm : numpy array or torch tensor.
+
+    Plain arithmetic throughout, so this stays differentiable when handed
+    tensors. §7.1 samples dispersion coefficients as parameters and §7.3
+    backpropagates the reconstruction loss through them, so the model has to
+    survive autograd rather than only produce numbers.
+    """
+    if isinstance(coefficients, CauchyFit):
+        a, b, c = coefficients.a, coefficients.b, coefficients.c
+    else:
+        a, b, c = coefficients
+
+    wavelength_um = wavelengths_nm * 1e-3
+    inverse_squared = 1.0 / wavelength_um**2
+    return a + b * inverse_squared + c * inverse_squared**2
+
+
+def fit_cauchy(
+    material: str,
+    wavelengths_nm: NDArray | list[float] | None = None,
+    *,
+    terms: int = 3,
+    allow_absorbing: bool = False,
+) -> CauchyFit:
+    """Fit §4.4's Cauchy model to the measured data for ``material``.
+
+    Cauchy is linear in its coefficients once written in ``x = 1/λ²``, so this is
+    an exact linear least-squares solve rather than an iterative fit — there is
+    no starting guess to get wrong and no local minimum to fall into.
+
+    Parameters
+    ----------
+    material : one of :func:`available_materials`.
+    wavelengths_nm : grid to fit over. Defaults to 400-800 nm, clipped to the
+        material's published range.
+    terms : 2 fits ``A + B/λ²``; 3 adds the ``C/λ⁴`` term.
+    allow_absorbing : see below.
+
+    Raises
+    ------
+    ValueError
+        If the range contains appreciable absorption and ``allow_absorbing`` is
+        left False.
+
+    Notes
+    -----
+    **Why absorption is refused by default.** Cauchy is an empirical expansion in
+    even powers of ``1/λ``, valid only where the material is transparent — below
+    the absorption edge, in §4.4's phrasing. Physically it is the first terms of
+    a Sellmeier form far from any resonance: with the nearest absorption band
+    remote, ``λ²/(λ² − C²)`` expands in ``1/λ²`` and the series converges
+    quickly. Approach the edge and that expansion diverges, so the fit degrades
+    smoothly and misleadingly — the residuals grow, but the curve still looks
+    like a dispersion curve.
+
+    It also has no imaginary part at all, so it cannot represent ``k``. Fitting
+    it across an absorption edge produces a real index for a material that is
+    absorbing there, which is not a poor fit but a wrong model. §4.4 sends those
+    materials to a Lorentz oscillator instead (DTFM-022).
+
+    The flag exists so that failure can be *demonstrated* deliberately, which the
+    tests do — not as a convenience for fitting absorbing materials.
+    """
+    if terms not in (2, 3):
+        raise ValueError(f"terms must be 2 or 3, got {terms}")
+
+    low_nm, high_nm = material_range_nm(material)
+    if wavelengths_nm is None:
+        wavelengths_nm = np.linspace(max(low_nm, 400.0), min(high_nm, 800.0), 200)
+    wavelengths_nm = np.asarray(wavelengths_nm, dtype=float)
+
+    n, k = load_nk(material, wavelengths_nm)
+    max_k = float(np.max(k))
+    if max_k > 1e-3 and not allow_absorbing:
+        raise ValueError(
+            f"{material} absorbs over {wavelengths_nm.min():.0f}-{wavelengths_nm.max():.0f} nm "
+            f"(max k = {max_k:.3g}). Cauchy is valid only below the absorption edge and has no "
+            "imaginary part to represent k with, so fitting here would give a real index for an "
+            "absorbing material — a wrong model rather than a poor fit. Use a Lorentz oscillator "
+            "(§4.4), restrict the range, or pass allow_absorbing=True to demonstrate the failure."
+        )
+
+    wavelength_um = wavelengths_nm * 1e-3
+    inverse_squared = 1.0 / wavelength_um**2
+    columns = [np.ones_like(inverse_squared), inverse_squared]
+    if terms == 3:
+        columns.append(inverse_squared**2)
+
+    coefficients, *_ = np.linalg.lstsq(np.column_stack(columns), n, rcond=None)
+    padded = list(coefficients) + [0.0] * (3 - len(coefficients))
+
+    residual = np.column_stack(columns) @ coefficients - n
+    return CauchyFit(
+        a=float(padded[0]),
+        b=float(padded[1]),
+        c=float(padded[2]),
+        rms_residual=float(np.sqrt(np.mean(residual**2))),
+        max_residual=float(np.max(np.abs(residual))),
+        range_nm=(float(wavelengths_nm.min()), float(wavelengths_nm.max())),
+        max_k_in_range=max_k,
+    )
