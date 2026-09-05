@@ -16,6 +16,9 @@ dependencies = [
     "numpy==2.5.2",
     "scipy==1.18.1",
     "matplotlib==3.11.1",
+    # Reads the vendored refractiveindex.info files, which are kept in their
+    # original YAML so the citations and licence headers travel with the data.
+    "pyyaml==6.0.3",
 ]
 
 [project.optional-dependencies]
