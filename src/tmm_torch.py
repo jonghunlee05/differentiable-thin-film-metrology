@@ -22,7 +22,17 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["as_complex", "cos_theta_t", "fresnel_r", "is_forward", "reflectance"]
+__all__ = [
+    "as_complex",
+    "cos_theta_t",
+    "fresnel_r",
+    "fresnel_t",
+    "interface_matrix",
+    "is_forward",
+    "layer_matrix",
+    "layer_phase",
+    "reflectance",
+]
 
 _CDTYPE = torch.complex128
 
@@ -149,3 +159,115 @@ def reflectance(
     """
     r_s, r_p = fresnel_r(n_i, n_j, theta_i)
     return r_s.abs() ** 2, r_p.abs() ** 2
+
+
+def fresnel_t(
+    n_i: torch.Tensor | float,
+    n_j: torch.Tensor | float,
+    theta_i: torch.Tensor | float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Amplitude transmission coefficients ``(t_s, t_p)`` at one interface.
+
+    Needed because the §4.3 interface matrix carries a factor ``1/t_ij``. Written
+    with the same denominators as :func:`fresnel_r`, so the two obey the Stokes
+    relations that :mod:`tests.test_tmm` asserts::
+
+        t_s = 1 + r_s
+        t_p = (n_i / n_j) · (1 + r_p)
+
+    The p relation carries the index ratio because of the §4.2 sign convention
+    for ``r_p``; see the discussion in :mod:`src.fresnel`.
+    """
+    n_i, n_j = as_complex(n_i), as_complex(n_j)
+    cos_i = torch.cos(as_complex(theta_i))
+    cos_j = cos_theta_t(n_i, n_j, theta_i)
+
+    t_s = (2.0 * n_i * cos_i) / (n_i * cos_i + n_j * cos_j)
+    t_p = (2.0 * n_i * cos_i) / (n_j * cos_i + n_i * cos_j)
+    return t_s, t_p
+
+
+def _stack_2x2(m00: torch.Tensor, m01: torch.Tensor,
+               m10: torch.Tensor, m11: torch.Tensor) -> torch.Tensor:
+    """Assemble a batch of 2x2 matrices with shape ``(..., 2, 2)``."""
+    row0 = torch.stack((m00, m01), dim=-1)
+    row1 = torch.stack((m10, m11), dim=-1)
+    return torch.stack((row0, row1), dim=-2)
+
+
+def interface_matrix(
+    n_i: torch.Tensor | float,
+    n_j: torch.Tensor | float,
+    theta_i: torch.Tensor | float,
+    polarisation: str,
+) -> torch.Tensor:
+    """The §4.3 interface matrix ``I_ij = (1/t_ij)·[[1, r_ij], [r_ij, 1]]``.
+
+    Returns shape ``(..., 2, 2)``, broadcasting over wavelength and any swept
+    parameter, so a whole spectrum is one call.
+
+    Parameters
+    ----------
+    polarisation : ``"s"`` or ``"p"``. The two are independent until they are
+        combined into an intensity, and §4.3 requires both.
+    """
+    r_s, r_p = fresnel_r(n_i, n_j, theta_i)
+    t_s, t_p = fresnel_t(n_i, n_j, theta_i)
+    r, t = _select_polarisation(polarisation, (r_s, r_p), (t_s, t_p))
+
+    ones = torch.ones_like(r)
+    return _stack_2x2(ones, r, r, ones) / t.unsqueeze(-1).unsqueeze(-1)
+
+
+def layer_phase(
+    n: torch.Tensor | float,
+    thickness: torch.Tensor | float,
+    wavelength: torch.Tensor | float,
+    cos_theta: torch.Tensor,
+) -> torch.Tensor:
+    """Phase accumulated crossing a layer, ``δ = (2π/λ)·ñ·d·cosθ`` (§4.3).
+
+    ``thickness`` and ``wavelength`` must share units; only their ratio enters.
+    For an absorbing layer ``δ`` has a positive imaginary part, which is what
+    makes ``exp(iδ)`` a decay — the branch selection in :func:`cos_theta_t` is
+    what guarantees that sign.
+    """
+    n = as_complex(n)
+    two_pi_over_lambda = 2.0 * torch.pi / as_complex(wavelength)
+    return two_pi_over_lambda * n * as_complex(thickness) * cos_theta
+
+
+def layer_matrix(
+    n: torch.Tensor | float,
+    thickness: torch.Tensor | float,
+    wavelength: torch.Tensor | float,
+    cos_theta: torch.Tensor,
+) -> torch.Tensor:
+    """The §4.3 propagation matrix ``L_j = diag(exp(−iδ), exp(+iδ))``.
+
+    Returns shape ``(..., 2, 2)``. A zero thickness gives the identity, which is
+    the check that the phase convention has not picked up a stray factor.
+
+    A transfer matrix maps the fields at the far side of the layer back to the
+    near side, so it un-propagates rather than propagates. For an absorbing
+    layer that inverts which entry shrinks: ``|L[0,0]| = exp(+Im δ) > 1`` while
+    ``|L[1,1]| = exp(−Im δ) < 1``, with the two exact reciprocals and
+    ``det L = 1``. The entry above one is not gain — reading it as such is the
+    obvious way to mistakenly conclude the branch selection in
+    :func:`cos_theta_t` is broken.
+    """
+    delta = layer_phase(n, thickness, wavelength, cos_theta)
+    zero = torch.zeros_like(delta)
+    return _stack_2x2(torch.exp(-1j * delta), zero, zero, torch.exp(1j * delta))
+
+
+def _select_polarisation(
+    polarisation: str,
+    s_and_p: tuple[torch.Tensor, torch.Tensor],
+    other_s_and_p: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if polarisation == "s":
+        return s_and_p[0], other_s_and_p[0]
+    if polarisation == "p":
+        return s_and_p[1], other_s_and_p[1]
+    raise ValueError(f"polarisation must be 's' or 'p', got {polarisation!r}")

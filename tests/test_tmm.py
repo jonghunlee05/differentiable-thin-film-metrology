@@ -254,3 +254,175 @@ def test_gradients_flow_through_the_branch_selection():
 
     assert torch.all(torch.isfinite(theta.grad))
     assert torch.any(theta.grad != 0.0)
+
+
+# --- interface and layer matrices, DTFM-011 ---------------------------------
+#
+# Spec §4.3. These are the building blocks the stack product is made of, so a
+# convention error here propagates into every spectrum the project ever
+# produces. The tests below pin the conventions rather than the arithmetic.
+
+WAVELENGTH = 550.0  # nm; only the ratio d/λ enters
+POLARISATIONS = ["s", "p"]
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_interface_matrix_reproduces_the_fresnel_coefficient(n_i, n_j, pol):
+    """The strongest available check on the interface matrix.
+
+    §4.3 extracts r from a stack as M[1,0]/M[0,0]. For a bare interface the
+    stack *is* I_ij, so that ratio must return the §4.2 coefficient exactly.
+    This ties the matrix convention to the already-validated coefficients
+    rather than trusting the transcription.
+    """
+    theta = torch.tensor(THETA)
+    M = pt.interface_matrix(n_i, n_j, theta, pol)
+    r_expected = pt.fresnel_r(n_i, n_j, theta)[POLARISATIONS.index(pol)]
+
+    assert torch.allclose(M[..., 1, 0] / M[..., 0, 0], r_expected, atol=1e-13)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_interface_matrix_shape_and_structure(n_i, n_j, pol):
+    """Shape (..., 2, 2), symmetric off-diagonal, equal diagonal — the form
+    (1/t)·[[1, r], [r, 1]] demands all three.
+    """
+    M = pt.interface_matrix(n_i, n_j, torch.tensor(THETA), pol)
+
+    assert M.shape == (THETA.size, 2, 2)
+    assert torch.allclose(M[..., 0, 1], M[..., 1, 0], atol=1e-14)
+    assert torch.allclose(M[..., 0, 0], M[..., 1, 1], atol=1e-14)
+
+
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_stokes_relations_between_r_and_t(n_i, n_j):
+    """t is new code; r is already trusted. The Stokes relations tie them.
+
+    Under the §4.2 sign convention, t_s = 1 + r_s exactly, while the p relation
+    carries the index ratio: t_p = (n_i/n_j)·(1 + r_p). Getting the p convention
+    wrong is the classic thin-film error, and it would show up here.
+    """
+    theta = torch.tensor(THETA)
+    r_s, r_p = pt.fresnel_r(n_i, n_j, theta)
+    t_s, t_p = pt.fresnel_t(n_i, n_j, theta)
+
+    assert torch.allclose(t_s, 1.0 + r_s, atol=1e-13)
+    assert torch.allclose(t_p, (n_i / n_j) * (1.0 + r_p), atol=1e-13)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+def test_zero_thickness_layer_is_the_identity(pol):
+    """The acceptance criterion. A layer of no thickness must do nothing.
+
+    Sensitive to a stray factor in δ — a wrong 2π, or λ and d transposed — since
+    any of those would leave a residue at d = 0 only if the expression is
+    malformed, and would otherwise show up as a wrong period later, much harder
+    to attribute.
+    """
+    cos_theta = pt.cos_theta_t(1.0, 1.46, torch.tensor(THETA))
+    L = pt.layer_matrix(1.46, 0.0, WAVELENGTH, cos_theta)
+
+    identity = torch.eye(2, dtype=L.dtype).expand_as(L)
+    assert torch.allclose(L, identity, atol=1e-15)
+
+
+def test_layer_matrix_is_diagonal_with_unit_determinant():
+    """det L = exp(−iδ)·exp(+iδ) = 1 for every δ, real or complex.
+
+    A determinant drifting from one would mean the two diagonal entries are no
+    longer reciprocal, i.e. the propagation is creating or destroying amplitude.
+    """
+    cos_theta = pt.cos_theta_t(1.0, 1.46, torch.tensor(THETA))
+    L = pt.layer_matrix(1.46, 120.0, WAVELENGTH, cos_theta)
+
+    assert torch.allclose(L[..., 0, 1], torch.zeros_like(L[..., 0, 1]), atol=1e-15)
+    assert torch.allclose(L[..., 1, 0], torch.zeros_like(L[..., 1, 0]), atol=1e-15)
+    assert torch.allclose(torch.linalg.det(L), torch.ones_like(L[..., 0, 0]), atol=1e-12)
+
+
+def test_layer_phase_is_periodic_in_thickness():
+    """R is quasi-periodic in n·d/λ — spec §5.2(b), the fringe-order ambiguity.
+
+    Adding a half-wave of optical thickness advances δ by exactly π, so the
+    layer matrix returns to itself after a full wave. This is the mechanism
+    behind the degeneracy the whole project is built to characterise, and it is
+    worth pinning here at its source.
+    """
+    n, cos_theta = 1.46, pt.cos_theta_t(1.0, 1.46, torch.tensor(0.0))
+    d = WAVELENGTH / (2.0 * n)  # half-wave of optical thickness
+
+    L0 = pt.layer_matrix(n, 0.0, WAVELENGTH, cos_theta)
+    L_half = pt.layer_matrix(n, d, WAVELENGTH, cos_theta)
+    L_full = pt.layer_matrix(n, 2 * d, WAVELENGTH, cos_theta)
+
+    assert torch.allclose(L_half, -L0, atol=1e-12)
+    assert torch.allclose(L_full, L0, atol=1e-12)
+
+
+def test_absorbing_layer_gives_a_positive_imaginary_phase():
+    """The DTFM-010 branch choice, seen through the layer phase.
+
+    Absorption lives in Im(δ) = (2π/λ)·d·Im(ñ cosθ). The branch selection is
+    what makes this positive; the other root would flip its sign and the layer
+    would amplify.
+    """
+    n = 1.5 + 0.05j
+    cos_theta = pt.cos_theta_t(1.0, n, torch.tensor(0.3))
+
+    for d in (50.0, 200.0, 1000.0):
+        assert pt.layer_phase(n, d, WAVELENGTH, cos_theta).imag.item() > 0.0
+
+    assert pt.layer_phase(n, 0.0, WAVELENGTH, cos_theta).imag.item() == pytest.approx(0.0)
+
+
+def test_absorbing_layer_matrix_decays_in_one_entry_and_grows_in_the_other():
+    """A transfer matrix is not a propagator, and the difference matters here.
+
+    It maps the fields at the far side of the layer back to the near side, so it
+    *un*-propagates: the entry that decays physically appears inverted. With
+    Im(δ) > 0, |L[0,0]| = exp(+Im δ) > 1 and |L[1,1]| = exp(−Im δ) < 1, and the
+    two are exact reciprocals so det L = 1.
+
+    This is worth asserting explicitly because |L[0,0]| > 1 looks alarming — it
+    reads as gain — and a future reader checking for absorption would naturally
+    look at the first entry and conclude the DTFM-010 branch fix was wrong.
+    """
+    n = 1.5 + 0.05j
+    cos_theta = pt.cos_theta_t(1.0, n, torch.tensor(0.3))
+    thicknesses = (0.0, 50.0, 200.0, 1000.0)
+
+    mats = [pt.layer_matrix(n, d, WAVELENGTH, cos_theta) for d in thicknesses]
+    decaying = [m[1, 1].abs().item() for m in mats]
+    growing = [m[0, 0].abs().item() for m in mats]
+
+    assert decaying[0] == pytest.approx(1.0)
+    assert all(b < a for a, b in zip(decaying, decaying[1:], strict=False))
+    assert decaying[-1] < 0.6
+
+    for dec, gro in zip(decaying, growing, strict=True):
+        assert dec * gro == pytest.approx(1.0, rel=1e-12)
+
+
+def test_matrices_are_differentiable():
+    """§7.3's reconstruction loss backpropagates through these."""
+    d = torch.tensor(120.0, dtype=torch.float64, requires_grad=True)
+    cos_theta = pt.cos_theta_t(1.0, 1.46, torch.tensor(0.3))
+
+    L = pt.layer_matrix(1.46, d, WAVELENGTH, cos_theta)
+    L[0, 0].abs().backward()
+
+    assert torch.isfinite(d.grad) and d.grad.item() != 0.0
+
+    theta = torch.tensor(0.3, dtype=torch.float64, requires_grad=True)
+    M = pt.interface_matrix(1.0, 1.46, theta, "s")
+    M[1, 0].abs().backward()
+
+    assert torch.isfinite(theta.grad) and theta.grad.item() != 0.0
+
+
+def test_polarisation_argument_is_validated():
+    """A typo must fail loudly rather than silently selecting s."""
+    with pytest.raises(ValueError, match="must be 's' or 'p'"):
+        pt.interface_matrix(1.0, 1.46, torch.tensor(0.3), "S")
