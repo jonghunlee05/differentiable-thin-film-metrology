@@ -29,7 +29,14 @@ from src import dispersion as dp
 from src import generate as gen
 from src import tmm_torch as pt
 
-__all__ = ["FitResult", "forward_observable", "fit_least_squares", "wrapped_residual"]
+__all__ = [
+    "FitResult",
+    "fit_autograd",
+    "fit_least_squares",
+    "forward_observable",
+    "torch_residual",
+    "wrapped_residual",
+]
 
 #: Order of the fitted parameter vector, matching :attr:`gen.Batch.targets`.
 PARAMETER_NAMES = ("thickness_nm", "cauchy_a", "cauchy_b")
@@ -148,9 +155,7 @@ def fit_least_squares(
 
     def residual(parameters: NDArray) -> NDArray:
         with torch.no_grad():
-            model = forward_observable(
-                parameters, wavelengths_nm, measurement, substrate
-            ).numpy()
+            model = forward_observable(parameters, wavelengths_nm, measurement, substrate).numpy()
         return wrapped_residual(model, observed, measurement.observable)
 
     started = time.perf_counter()
@@ -169,5 +174,174 @@ def fit_least_squares(
         cost=float(solution.cost),
         residual_rms=float(np.sqrt(np.mean(solution.fun**2))),
         message=str(solution.message),
+        initial=start,
+    )
+
+
+def torch_residual(model: torch.Tensor, observed: torch.Tensor, observable: str) -> torch.Tensor:
+    """:func:`wrapped_residual`, in torch, differentiably.
+
+    The same arithmetic exists twice because the two fitters need different
+    things: ``scipy`` wants a numpy array and cannot accept a tensor, while
+    autograd needs the graph and cannot accept an array. Duplicated logic drifts,
+    so ``test_baseline.py`` asserts the two agree to machine precision on the
+    same inputs — including across the ±π seam, which is the only place they
+    could plausibly differ.
+
+    ``torch.remainder`` follows Python's sign convention rather than C's, so it
+    matches numpy's ``%``, and it is differentiable with unit gradient away from
+    the seam — which is what wrapping a residual needs.
+    """
+    difference = model - observed
+    if observable != "ellipsometry":
+        return difference
+
+    half = difference.numel() // 2
+    delta_part = torch.remainder(difference[half:] + np.pi, 2 * np.pi) - np.pi
+    return torch.cat([difference[:half], delta_part])
+
+
+def fit_autograd(
+    observed: NDArray,
+    wavelengths_nm: NDArray,
+    initial: NDArray | list[float],
+    *,
+    measurement: gen.Measurement | None = None,
+    prior: gen.Prior | None = None,
+    truth: NDArray | None = None,
+    optimiser: str = "lbfgs",
+    max_iterations: int = 200,
+    learning_rate: float | None = None,
+    learning_rate_decay: float = 0.999,
+    tolerance: float = 1e-14,
+) -> FitResult:
+    """Recover ``θ = (d, A, B)`` by descending through the simulator itself.
+
+    §6's second baseline. Where :func:`fit_least_squares` treats the forward
+    model as a black box and rebuilds its Jacobian by nudging each parameter in
+    turn, this asks the model for the exact gradient it already knows how to
+    give — one backward pass for all three derivatives, at any accuracy the
+    forward model has.
+
+    Two decisions carry the fit.
+
+    **Descent happens in normalised coordinates.** ``θ`` spans 20-2000 nm in
+    thickness and 0.002-0.012 in Cauchy ``B``, so ``∂L/∂d`` and ``∂L/∂B`` are
+    orders of magnitude apart and a single step size is either negligible for one
+    or divergent for another. Mapping the prior's box onto the unit cube makes
+    one step size meaningful for all three. This is not cosmetic: it is why the
+    fit converges at all, and ``test_baseline.py`` measures the spread it exists
+    to remove.
+
+    **Bounds are enforced by projection** back into the unit cube after each
+    step. That cube is the prior's support, and the same box
+    :func:`fit_least_squares` is given — §10 compares the two estimators, so
+    neither may search a region the other cannot.
+
+    ``optimiser`` selects which descent, and the choice is the interesting part:
+
+    ``"lbfgs"``
+        Quasi-Newton with a strong-Wolfe line search. This is the fair
+        head-to-head against Levenberg-Marquardt, because both build curvature
+        and both choose their own step length. It reaches the same answers to
+        about a nanometre in a billion.
+    ``"adam"``
+        The first-order optimiser §7.3 will train the network with. Included
+        because that comparison is the one that matters later — and because it
+        does *not* match: Adam's step size is set by its learning rate rather
+        than by the gradient, so it settles at an accuracy of roughly its own
+        step and no further. Decaying the rate lowers that floor without
+        removing it.
+    """
+    measurement = measurement or gen.Measurement()
+    prior = prior or gen.Prior()
+    if optimiser not in ("lbfgs", "adam"):
+        raise ValueError(f"optimiser must be 'lbfgs' or 'adam', got {optimiser!r}")
+
+    substrate_n, substrate_k = dp.load_nk(prior.substrate, wavelengths_nm)
+    substrate = torch.tensor(substrate_n + 1j * substrate_k)
+    observed_t = torch.as_tensor(np.asarray(observed, dtype=float))
+
+    lower = np.array([prior.thickness_nm[0], prior.cauchy_a[0], prior.cauchy_b[0]])
+    upper = np.array([prior.thickness_nm[1], prior.cauchy_a[1], prior.cauchy_b[1]])
+    span = torch.as_tensor(upper - lower)
+    floor = torch.as_tensor(lower)
+
+    start = np.clip(np.asarray(initial, dtype=float), lower, upper)
+    unit = torch.as_tensor((start - lower) / (upper - lower)).clone().requires_grad_(True)
+
+    def loss_and_grad() -> torch.Tensor:
+        """One forward pass, one backward pass, with the box respected."""
+        with torch.no_grad():
+            unit.clamp_(0.0, 1.0)
+        if unit.grad is not None:
+            unit.grad = None
+        model = forward_observable(floor + unit * span, wavelengths_nm, measurement, substrate)
+        loss = 0.5 * (torch_residual(model, observed_t, measurement.observable) ** 2).sum()
+        loss.backward()
+        return loss
+
+    evaluations = 0
+    started = time.perf_counter()
+
+    if optimiser == "lbfgs":
+        engine = torch.optim.LBFGS(
+            [unit],
+            lr=1.0 if learning_rate is None else learning_rate,
+            max_iter=max_iterations,
+            history_size=50,
+            tolerance_grad=1e-16,
+            tolerance_change=1e-18,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure() -> torch.Tensor:
+            nonlocal evaluations
+            evaluations += 1
+            return loss_and_grad()
+
+        engine.step(closure)
+        steps = engine.state_dict()["state"][0]["n_iter"]
+        converged = steps < max_iterations
+    else:
+        engine = torch.optim.Adam([unit], lr=0.005 if learning_rate is None else learning_rate)
+        schedule = torch.optim.lr_scheduler.ExponentialLR(engine, gamma=learning_rate_decay)
+        previous = float("inf")
+        converged = False
+        steps = 0
+        while steps < max_iterations and not converged:
+            steps += 1
+            current = float(loss_and_grad().detach())
+            engine.step()
+            schedule.step()
+            evaluations += 1
+            converged = abs(previous - current) <= tolerance * max(1.0, current)
+            previous = current
+
+    elapsed = time.perf_counter() - started
+
+    with torch.no_grad():
+        unit.clamp_(0.0, 1.0)
+        parameters = (floor + unit * span).detach()
+        final = torch_residual(
+            forward_observable(parameters, wavelengths_nm, measurement, substrate),
+            observed_t,
+            measurement.observable,
+        ).numpy()
+
+    return FitResult(
+        parameters=parameters.numpy(),
+        truth=None if truth is None else np.asarray(truth, dtype=float),
+        success=bool(converged),
+        iterations=int(steps),
+        function_evaluations=evaluations,
+        wall_clock_s=elapsed,
+        cost=float(0.5 * np.sum(final**2)),
+        residual_rms=float(np.sqrt(np.mean(final**2))),
+        message=(
+            f"{optimiser}: converged after {steps} iterations"
+            if converged
+            else f"{optimiser}: stopped at the iteration limit ({max_iterations})"
+        ),
         initial=start,
     )
