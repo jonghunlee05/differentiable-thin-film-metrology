@@ -6,6 +6,14 @@ spectrum:
   high_nm: 800.0
   points: 200          # §7.2 sizes the network input at ~200 values
 
+measurement:
+  # DTFM-028: ellipsometry adopted on measured evidence - 5 to 23x better
+  # thickness precision, largest gains in the thin regime. It carries no
+  # information at normal incidence, so the angle moved with the decision.
+  observable: ellipsometry
+  angle_deg: 70.0
+  ellipsometer_sigma_rad: 0.001   # 0.057 deg; at 0.57 deg it loses to reflectance
+
 prior:
   # §7.1 calls this a decision, not a detail. See src.generate.Prior for the
   # reasoning; the short version is that DTFM-068 measured the thin-film

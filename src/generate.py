@@ -35,7 +35,56 @@ from src import dispersion as dp
 from src import noise as nz
 from src import tmm_torch as pt
 
-__all__ = ["Batch", "Prior", "generate_batch", "load_config", "sample_parameters"]
+__all__ = [
+    "Batch",
+    "Measurement",
+    "Prior",
+    "generate_batch",
+    "load_config",
+    "sample_parameters",
+]
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """How the film is looked at — the geometry and the observable.
+
+    Separate from :class:`Prior` because it describes the *instrument*, not the
+    sample. §10's failure atlas varies one while holding the other.
+
+    Defaults follow DTFM-028: spectroscopic ellipsometry at 70°. That decision
+    was made from a Fisher-information comparison rather than from preference —
+    5 to 23x better thickness precision, with the largest gains in the thin
+    regime the project is written about.
+
+    ``reflectance`` is retained rather than removed. §10 wants both, and the
+    comparison is the evidence for the decision.
+    """
+
+    angle_deg: float = 70.0
+    observable: str = "ellipsometry"
+    ellipsometer_sigma_rad: float = 1e-3
+
+    def __post_init__(self) -> None:
+        if self.observable not in ("reflectance", "ellipsometry"):
+            raise ValueError(
+                f"observable must be 'reflectance' or 'ellipsometry', got {self.observable!r}"
+            )
+        if not 0.0 <= self.angle_deg < 90.0:
+            raise ValueError(f"angle must lie in [0, 90) degrees, got {self.angle_deg}")
+        if self.observable == "ellipsometry" and not pt.psi_delta_is_informative(
+            np.radians(self.angle_deg)
+        ):
+            raise ValueError(
+                f"ellipsometry at {self.angle_deg} deg carries little information: s and p "
+                "coincide at normal incidence, so r_p/r_s is nearly constant. DTFM-028 measured "
+                "the gain over reflectance as 0.1x at 10 deg, 1.1x at 30 deg and 111x at 70 deg. "
+                "Use a larger angle, or observable='reflectance'."
+            )
+
+    @property
+    def angle_rad(self) -> float:
+        return float(np.radians(self.angle_deg))
 
 
 @dataclass(frozen=True)
@@ -64,6 +113,29 @@ class Prior:
     because relative error at 30 nm is worth fewer nanometres than at 1500 nm.
     §10 stratifies error by regime anyway, so a single RMSE was never the number
     that mattered.
+
+    **Re-checked after DTFM-028.** That decision was taken on a reflectance study
+    at normal incidence, and adopting ellipsometry at 70° changed the numbers it
+    rested on. Relative Cramér-Rao bound on thickness, before and after:
+
+    ==========  ==================  ====================
+    thickness   reflectance @ 0°    ellipsometry @ 70°
+    ==========  ==================  ====================
+    20 nm       5.68%               0.158%
+    25 nm       3.31%               0.113%
+    100 nm      0.024%              0.0027%
+    1000 nm     0.025%              0.0012%
+    ==========  ==================  ====================
+
+    The thin regime is no longer *catastrophic* — 20 nm improved by 36x, and by
+    the earlier "worse than 0.2% relative" criterion the hard regime disappears
+    entirely. But the *ordering* is unchanged and the spread is still wide: 20 nm
+    remains about 130x harder relatively than 1000 nm.
+
+    So log-uniform stands, on a weaker argument than it was chosen for. It is now
+    "the thin end is still much the hardest part of the range" rather than "the
+    thin end is unrecoverable and needs every example it can get". Worth being
+    explicit about, because the original reasoning no longer holds as stated.
 
     Dispersion
     ----------
@@ -124,6 +196,7 @@ class Batch:
 
     wavelengths_nm: np.ndarray
     spectra: np.ndarray
+    observable: str
     thickness_nm: np.ndarray
     cauchy_a: np.ndarray
     cauchy_b: np.ndarray
@@ -134,6 +207,18 @@ class Batch:
     def targets(self) -> np.ndarray:
         """``θ`` as an ``(N, 3)`` array — what a network is asked to predict."""
         return np.stack([self.thickness_nm, self.cauchy_a, self.cauchy_b], axis=1)
+
+    @property
+    def psi_delta(self) -> tuple[np.ndarray, np.ndarray]:
+        """Split an ellipsometric batch back into ``(Ψ, Δ)``.
+
+        Stored concatenated so a network sees one flat input vector, which is
+        what §7.2 sizes its first layer against.
+        """
+        if self.observable != "ellipsometry":
+            raise ValueError(f"batch holds {self.observable}, not ellipsometry")
+        half = self.spectra.shape[1] // 2
+        return self.spectra[:, :half], self.spectra[:, half:]
 
 
 def sample_parameters(prior: Prior, count: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
@@ -158,24 +243,31 @@ def generate_batch(
     prior: Prior | None = None,
     corruption: nz.Corruption | None = None,
     rng: np.random.Generator | None = None,
+    measurement: Measurement | None = None,
 ) -> Batch:
     """§7.1's loop: sample θ, run the forward model, corrupt, return the pair.
 
-    The clean spectra are kept alongside the corrupted ones. They are not
-    training inputs — a network never sees them — but §7.3's reconstruction loss
-    and §10's failure atlas both need to know what the measurement *would* have
-    been, and regenerating them later would mean re-running the simulator with
-    the same seed and hoping.
+    The observable follows :class:`Measurement` — ellipsometric ``(Ψ, Δ)`` at
+    oblique incidence by default, per DTFM-028, or reflectance for comparison.
+
+    The clean channel is kept alongside the corrupted one. It is not a training
+    input — a network never sees it — but §7.3's reconstruction loss and §10's
+    failure atlas both need to know what the measurement *would* have been, and
+    regenerating it later would mean re-running the simulator with the same seed
+    and hoping.
     """
     prior = prior or Prior()
     corruption = corruption or nz.Corruption()
+    measurement = measurement or Measurement()
     rng = rng or np.random.default_rng()
 
     parameters = sample_parameters(prior, count, rng)
     substrate_n, substrate_k = dp.load_nk(prior.substrate, wavelengths_nm)
     substrate = torch.tensor(substrate_n + 1j * substrate_k)
+    angle = measurement.angle_rad
 
-    clean = np.empty((count, wavelengths_nm.size))
+    width = wavelengths_nm.size * (2 if measurement.observable == "ellipsometry" else 1)
+    clean = np.empty((count, width))
     observed = np.empty_like(clean)
 
     for i in range(count):
@@ -183,22 +275,52 @@ def generate_batch(
             (parameters["cauchy_a"][i], parameters["cauchy_b"][i], 0.0), wavelengths_nm
         )
         per_film = replace(corruption, roughness_nm=float(parameters["roughness_nm"][i]))
-
-        def forward(grid_nm, thickness, _n=film_index, _c=per_film):
-            thicknesses, indices = _c.stack_with_defects([float(thickness)], [1.0, _n, substrate])
-            return pt.stack_reflectance(
-                torch.tensor(np.asarray(grid_nm, dtype=float)), thicknesses, indices, 0.0, "s"
-            ).numpy()
-
-        clean[i] = forward(wavelengths_nm, parameters["thickness_nm"][i])
-        observed[i] = nz.corrupt(
-            wavelengths_nm, forward, float(parameters["thickness_nm"][i]), per_film, rng
+        thicknesses, indices = per_film.stack_with_defects(
+            [float(parameters["thickness_nm"][i])], [1.0, film_index, substrate]
         )
+        grid = torch.tensor(wavelengths_nm)
+
+        if measurement.observable == "ellipsometry":
+            psi, delta = pt.stack_psi_delta(grid, thicknesses, indices, angle)
+            clean[i] = np.concatenate([psi.numpy(), delta.numpy()])
+
+            # Finite bandwidth is applied to the complex ratio rather than to Ψ
+            # and Δ separately. A spectroscopic ellipsometer averages the
+            # measured polarisation *state* over its slit width, and averaging Δ
+            # directly would blur across its ±π wrap and invent values that no
+            # film produces.
+            ratio = pt.stack_rho(grid, thicknesses, indices, angle).numpy()
+            if per_film.bandwidth_fwhm_nm:
+                ratio = nz.apply_spectrometer_bandwidth(
+                    wavelengths_nm, ratio.real, per_film.bandwidth_fwhm_nm
+                ) + 1j * nz.apply_spectrometer_bandwidth(
+                    wavelengths_nm, ratio.imag, per_film.bandwidth_fwhm_nm
+                )
+
+            noisy_psi, noisy_delta = nz.add_ellipsometer_noise(
+                np.arctan(np.abs(ratio)),
+                np.arctan2(ratio.imag, ratio.real),
+                rng,
+                sigma_rad=measurement.ellipsometer_sigma_rad,
+            )
+            observed[i] = np.concatenate([noisy_psi, noisy_delta])
+        else:
+            def forward(grid_nm, thickness, _n=film_index, _c=per_film):
+                layers, media = _c.stack_with_defects([float(thickness)], [1.0, _n, substrate])
+                return pt.stack_reflectance(
+                    torch.tensor(np.asarray(grid_nm, dtype=float)), layers, media, angle, "s"
+                ).numpy()
+
+            clean[i] = forward(wavelengths_nm, parameters["thickness_nm"][i])
+            observed[i] = nz.corrupt(
+                wavelengths_nm, forward, float(parameters["thickness_nm"][i]), per_film, rng
+            )
 
     return Batch(
         wavelengths_nm=wavelengths_nm,
         spectra=observed,
         clean_spectra=clean,
+        observable=measurement.observable,
         **parameters,
     )
 
@@ -219,19 +341,31 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(arguments.config)
     prior = Prior(**config["prior"])
     corruption = nz.Corruption(**config.get("corruption", {}))
+    measurement = Measurement(**config.get("measurement", {}))
     spectrum = config["spectrum"]
     wavelengths = np.linspace(spectrum["low_nm"], spectrum["high_nm"], spectrum["points"])
 
     count = arguments.count or config["batch"]["count"]
     seed = arguments.seed if arguments.seed is not None else config["batch"]["seed"]
-    batch = generate_batch(wavelengths, count, prior, corruption, np.random.default_rng(seed))
+    batch = generate_batch(
+        wavelengths, count, prior, corruption, np.random.default_rng(seed), measurement
+    )
 
+    print(f"  measurement  {measurement.observable} at {measurement.angle_deg:.0f} deg")
     print(f"  prior        {prior.spacing} thickness over {prior.thickness_nm} nm")
     print(f"  support      {prior.support}")
-    print(f"  corruption   {', '.join(corruption.active)}")
+    applied = [
+        effect
+        for effect in corruption.active
+        if measurement.observable == "reflectance" or effect != "detector noise"
+    ]
+    if measurement.observable == "ellipsometry":
+        angular = np.degrees(measurement.ellipsometer_sigma_rad)
+        applied.append(f"ellipsometer noise {angular:.3f} deg")
+    print(f"  corruption   {', '.join(applied)}")
     print(f"  spectra      {batch.spectra.shape}  seed {seed}")
     print(f"  thickness    {batch.thickness_nm.min():.1f} - {batch.thickness_nm.max():.1f} nm")
-    print(f"  reflectance  {batch.spectra.min():.4f} - {batch.spectra.max():.4f}")
+    print(f"  observable   {batch.spectra.min():.4f} - {batch.spectra.max():.4f}")
     return 0
 
 
