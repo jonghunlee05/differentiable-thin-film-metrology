@@ -21,15 +21,21 @@ atlas is largely a catalogue of which of these the estimator can tell apart.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
 __all__ = [
+    "Corruption",
     "add_backside_reflection",
+    "add_detector_noise",
     "add_interfacial_layer",
     "add_surface_roughness",
     "apply_spectrometer_bandwidth",
+    "apply_baseline_drift",
+    "apply_wavelength_calibration",
     "average_over_thickness",
+    "corrupt",
     "bruggeman_epsilon",
     "effective_medium_index",
 ]
@@ -283,3 +289,184 @@ def add_backside_reflection(
         raise ValueError("transmittance must lie in [0, 1]")
 
     return values + transmittance**2 * back_face
+
+
+# --- instrument errors and detector noise, DTFM-025 -------------------------
+
+
+def apply_wavelength_calibration(recorded_nm, scale: float = 0.0, offset_nm: float = 0.0):
+    """True wavelength behind each recorded one: ``λ → λ(1+α) + β`` (§4.5).
+
+    A spectrometer reports the wavelength it *believes* it measured. If its
+    calibration has drifted, the light at the channel labelled 550 nm was really
+    at a slightly different wavelength, so the spectrum should be evaluated
+    there instead.
+
+    §4.5 gives the consequence as a **systematic thickness bias**, and the
+    mechanism is direct: fringe positions carry the thickness, so mislabelling
+    the wavelength axis mislabels the thickness. Unlike detector noise this does
+    not average away with repeated measurements — it is the same error every
+    time, which is what makes it dangerous.
+    """
+    return np.asarray(recorded_nm, dtype=float) * (1.0 + scale) + offset_nm
+
+
+def apply_baseline_drift(reflectance, gain: float = 1.0, offset: float = 0.0):
+    """Multiplicative and additive drift in the measured level: ``R → aR + b``.
+
+    Source intensity drifts, the reference measurement ages, stray light adds a
+    floor. §4.5 notes this **correlates with the dispersion parameters**, which
+    is the reason it matters here rather than being a nuisance: raising the whole
+    curve looks a little like raising the index, so a fit can trade one against
+    the other. Another entry for §10's atlas.
+    """
+    if gain <= 0.0:
+        raise ValueError(f"gain must be positive, got {gain}")
+    return gain * np.asarray(reflectance, dtype=float) + offset
+
+
+def add_detector_noise(
+    reflectance,
+    rng: np.random.Generator,
+    *,
+    shot_scale: float = 3e-3,
+    read_sigma: float = 5e-4,
+):
+    """Shot noise plus additive detector noise, per §7.1.
+
+    Shot noise is Poisson in photon count, so its standard deviation scales as
+    ``sqrt(R)`` — the bright parts of a spectrum are noisier in absolute terms
+    and quieter in relative terms. Read noise is independent of signal and
+    dominates where R is small, which is exactly where an anti-reflection null
+    or a fringe minimum sits.
+
+    That split matters for §8: the aleatoric uncertainty the network is asked to
+    predict is *not* uniform across a spectrum, and a model assuming constant
+    noise would misstate it in both directions.
+
+    Takes an explicit ``Generator`` rather than using global state, so a run is
+    reproducible from its seed alone (§15).
+    """
+    if shot_scale < 0.0 or read_sigma < 0.0:
+        raise ValueError("noise scales must be non-negative")
+
+    values = np.asarray(reflectance, dtype=float)
+    sigma = np.sqrt(shot_scale**2 * np.clip(values, 0.0, None) + read_sigma**2)
+    return values + rng.normal(0.0, sigma)
+
+
+@dataclass(frozen=True)
+class Corruption:
+    """Everything §4.5 can do to a measurement, in one configurable object.
+
+    Defaults describe a decent instrument looking at a real film: a finite slit
+    width, a little surface roughness, and both noise terms. That is four of the
+    seven effects active, above the three §4.5 asks for. The remaining three —
+    an interfacial layer, a calibration error, baseline drift — default to off
+    because they are *faults* rather than facts of life, and the failure atlas
+    of §10 wants to switch them on deliberately.
+    """
+
+    roughness_nm: float = 1.0
+    interfacial_nm: float = 0.0
+    spot_sigma_nm: float = 0.0
+    bandwidth_fwhm_nm: float = 3.0
+    wavelength_scale: float = 0.0
+    wavelength_offset_nm: float = 0.0
+    baseline_gain: float = 1.0
+    baseline_offset: float = 0.0
+    shot_scale: float = 3e-3
+    read_sigma: float = 5e-4
+    backside_substrate_index: float | None = None
+
+    def stack_with_defects(self, thicknesses: Sequence, indices: Sequence) -> tuple[list, list]:
+        """Apply the two defects that change the stack (DTFM-023).
+
+        These belong here rather than in :func:`corrupt` because they alter what
+        the film *is*, not what the instrument records — so they must be applied
+        before the forward model runs. Keeping them on the same object means one
+        description of the whole measurement, and means :attr:`active` cannot
+        claim an effect that nothing applies.
+        """
+        thicknesses, indices = add_surface_roughness(thicknesses, indices, self.roughness_nm)
+        return add_interfacial_layer(thicknesses, indices, self.interfacial_nm)
+
+    @property
+    def active(self) -> tuple[str, ...]:
+        """Which effects are switched on — useful as a failure-atlas row (§10).
+
+        The first two are applied by :meth:`stack_with_defects`, the rest by
+        :func:`corrupt`.
+        """
+        names = []
+        if self.roughness_nm:
+            names.append("roughness")
+        if self.interfacial_nm:
+            names.append("interfacial layer")
+        if self.spot_sigma_nm:
+            names.append("spot non-uniformity")
+        if self.bandwidth_fwhm_nm:
+            names.append("bandwidth")
+        if self.wavelength_scale or self.wavelength_offset_nm:
+            names.append("wavelength calibration")
+        if self.baseline_gain != 1.0 or self.baseline_offset:
+            names.append("baseline drift")
+        if self.shot_scale or self.read_sigma:
+            names.append("detector noise")
+        if self.backside_substrate_index is not None:
+            names.append("backside reflection")
+        return tuple(names)
+
+
+def corrupt(
+    wavelengths_nm,
+    forward,
+    thickness_nm: float,
+    corruption: Corruption | None = None,
+    rng: np.random.Generator | None = None,
+):
+    """Turn an ideal spectrum into a measured one — §7.1's ``corrupt``.
+
+    ``forward(wavelengths_nm, thickness_nm)`` must return a clean reflectance,
+    built from a stack that has already been through
+    :meth:`Corruption.stack_with_defects` — roughness and the interfacial layer
+    change what the film is, so they cannot be applied to a finished spectrum.
+
+    Order is not arbitrary — it follows the light:
+
+    1. **wavelength calibration** — decides which wavelengths were really seen,
+       so it must come before the spectrum is evaluated at all
+    2. **spot non-uniformity** — the detector sums over the illuminated area
+    3. **bandwidth** — the instrument then averages neighbouring wavelengths
+    4. **backside reflection** — added incoherently at the detector
+    5. **baseline drift** — the instrument's own gain and offset
+    6. **detector noise** — last, because nothing downstream of the detector
+       smooths it
+
+    Applying noise before the blur would let the instrument average away noise it
+    has not generated yet, which understates the uncertainty §8 has to model.
+    """
+    corruption = corruption or Corruption()
+    rng = rng or np.random.default_rng()
+
+    recorded = np.asarray(wavelengths_nm, dtype=float)
+    true_wavelengths = apply_wavelength_calibration(
+        recorded, corruption.wavelength_scale, corruption.wavelength_offset_nm
+    )
+
+    spectrum = average_over_thickness(
+        lambda d: np.asarray(forward(true_wavelengths, d), dtype=float),
+        thickness_nm,
+        corruption.spot_sigma_nm,
+    )
+    spectrum = apply_spectrometer_bandwidth(recorded, spectrum, corruption.bandwidth_fwhm_nm)
+
+    if corruption.backside_substrate_index is not None:
+        spectrum = add_backside_reflection(spectrum, corruption.backside_substrate_index)
+
+    spectrum = apply_baseline_drift(
+        spectrum, corruption.baseline_gain, corruption.baseline_offset
+    )
+    return add_detector_noise(
+        spectrum, rng, shot_scale=corruption.shot_scale, read_sigma=corruption.read_sigma
+    )

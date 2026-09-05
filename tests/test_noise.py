@@ -460,3 +460,252 @@ def test_backside_reflection_adds_an_offset_rather_than_fringes():
 def test_backside_reflection_rejects_impossible_transmittance():
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         noise.add_backside_reflection(_clean(THICK_FILM), 1.52, transmittance=1.5)
+
+
+# --- instrument errors, detector noise, and corrupt(), DTFM-025 -------------
+#
+# Spec §4.5 and §7.1. The last three effects, plus the pipeline that assembles
+# all seven into one measured spectrum.
+
+
+def _forward(wavelengths, thickness):
+    return pt.stack_reflectance(
+        torch.tensor(np.asarray(wavelengths, dtype=float)),
+        [float(thickness)],
+        [1.0, FILM, SUBSTRATE],
+        0.0,
+        "s",
+    ).numpy()
+
+
+# --- wavelength calibration -------------------------------------------------
+
+
+def test_wavelength_calibration_is_identity_when_uncalibrated():
+    assert np.array_equal(
+        BLUR_WAVELENGTHS, noise.apply_wavelength_calibration(BLUR_WAVELENGTHS)
+    )
+
+
+def test_wavelength_calibration_applies_scale_and_offset():
+    shifted = noise.apply_wavelength_calibration(np.array([500.0]), 0.01, 2.0)
+    assert shifted[0] == pytest.approx(500.0 * 1.01 + 2.0)
+
+
+def test_a_calibration_error_biases_thickness_and_does_not_average_away():
+    """§4.5's "systematic thickness bias", quantified.
+
+    Fringe positions carry the thickness, so mislabelling the wavelength axis
+    mislabels the thickness. Unlike detector noise this is the *same* error on
+    every repeat — no amount of averaging removes it, which is what makes a
+    calibration drift more dangerous than a noisy detector.
+    """
+    truth = 420.0
+    observed = _forward(noise.apply_wavelength_calibration(BLUR_WAVELENGTHS, 0.002, 0.0), truth)
+
+    def residual(parameters):
+        return _forward(BLUR_WAVELENGTHS, parameters[0]) - observed
+
+    recovered = float(least_squares(residual, [truth], bounds=([50.0], [900.0])).x[0])
+
+    assert abs(recovered - truth) > 0.5, "a 0.2% wavelength error should move the answer"
+    assert abs(recovered - truth) < 5.0
+
+
+# --- baseline drift ---------------------------------------------------------
+
+
+def test_baseline_drift_is_identity_by_default():
+    spectrum = _clean(THICK_FILM)
+    assert np.array_equal(spectrum, noise.apply_baseline_drift(spectrum))
+
+
+def test_baseline_drift_scales_and_shifts():
+    spectrum = _clean(THICK_FILM)
+    drifted = noise.apply_baseline_drift(spectrum, 1.05, 0.01)
+
+    assert np.allclose(drifted, 1.05 * spectrum + 0.01)
+
+
+def test_baseline_drift_correlates_with_the_index():
+    """§4.5: "correlates with dispersion parameters", in the §5.3 sense.
+
+    My first attempt asked whether some index could *mimic* a gain change. None
+    can — even with thickness free the best fit is no better than doing nothing.
+    That was the wrong test: correlation is a statement about the Jacobian, not
+    about one parameter impersonating another.
+
+    Taken properly, the effect is severe. With thickness, index, gain and offset
+    all free, every off-diagonal correlation exceeds 0.99 in magnitude: the
+    measurement cannot separate a brighter lamp from a denser film.
+    """
+    wavelengths = torch.linspace(450.0, 800.0, 300, dtype=torch.float64)
+    theta = torch.tensor([900.0, 1.46, 1.0, 0.0], dtype=torch.float64)
+
+    def model(parameters):
+        spectrum = pt.stack_reflectance(
+            wavelengths, [parameters[0]], [1.0, parameters[1], SUBSTRATE], 0.0, "s"
+        )
+        return parameters[2] * spectrum + parameters[3]
+
+    jacobian = torch.autograd.functional.jacobian(model, theta)
+    covariance = torch.linalg.inv(jacobian.T @ jacobian)
+    scale = torch.sqrt(torch.diag(covariance))
+    correlation = covariance / (scale[:, None] * scale[None, :])
+
+    assert abs(correlation[1, 2].item()) > 0.99, "index vs gain"
+    assert abs(correlation[1, 3].item()) > 0.99, "index vs offset"
+
+
+def test_fitting_the_drift_wrecks_the_conditioning():
+    """The cost of the previous test, and why §6 asks about model complexity.
+
+    Adding gain and offset as free parameters raises the condition number of
+    JᵀJ by a factor of ~550. The extra parameters do not buy accuracy; they buy
+    a nearly singular problem and wider error bars on everything.
+
+    §6's DTFM-035 asks this formally with AIC/BIC — "is my model too complex for
+    the information my measurement contains". This is that question with a
+    number attached, met before the ticket that asks it.
+    """
+    wavelengths = torch.linspace(450.0, 800.0, 300, dtype=torch.float64)
+
+    def condition(with_drift: bool) -> float:
+        count = 4 if with_drift else 2
+        theta = torch.tensor([900.0, 1.46, 1.0, 0.0][:count], dtype=torch.float64)
+
+        def model(parameters):
+            spectrum = pt.stack_reflectance(
+                wavelengths, [parameters[0]], [1.0, parameters[1], SUBSTRATE], 0.0, "s"
+            )
+            return parameters[2] * spectrum + parameters[3] if with_drift else spectrum
+
+        jacobian = torch.autograd.functional.jacobian(model, theta)
+        return torch.linalg.cond(jacobian.T @ jacobian).item()
+
+    plain, with_drift = condition(False), condition(True)
+
+    assert with_drift > 100 * plain
+    assert with_drift < 1e13, "still invertible in float64, so the correlations mean something"
+
+
+def test_non_positive_gain_is_rejected():
+    with pytest.raises(ValueError, match="gain must be positive"):
+        noise.apply_baseline_drift(_clean(THICK_FILM), 0.0)
+
+
+# --- detector noise ---------------------------------------------------------
+
+
+def test_noise_is_reproducible_from_its_seed():
+    """§15: fixed seed, fixed output. An explicit Generator, never global state."""
+    spectrum = _clean(THICK_FILM)
+    first = noise.add_detector_noise(spectrum, np.random.default_rng(7))
+    second = noise.add_detector_noise(spectrum, np.random.default_rng(7))
+    different = noise.add_detector_noise(spectrum, np.random.default_rng(8))
+
+    assert np.array_equal(first, second)
+    assert not np.array_equal(first, different)
+
+
+def test_shot_noise_scales_with_the_square_root_of_the_signal():
+    """§7.1's noise model, and it matters for §8.
+
+    Shot noise is Poisson in photon count, so σ ∝ sqrt(R): bright parts of a
+    spectrum are noisier in absolute terms. The aleatoric uncertainty the network
+    is asked to predict is therefore *not* uniform across a spectrum, and a model
+    assuming constant noise would misstate it in both directions.
+    """
+    rng = np.random.default_rng(0)
+    bright = np.full(60_000, 0.36)
+    dim = np.full(60_000, 0.04)
+
+    spread_bright = (noise.add_detector_noise(bright, rng, read_sigma=0.0) - bright).std()
+    spread_dim = (noise.add_detector_noise(dim, rng, read_sigma=0.0) - dim).std()
+
+    assert spread_bright / spread_dim == pytest.approx(np.sqrt(0.36 / 0.04), rel=0.05)
+
+
+def test_read_noise_dominates_where_the_signal_is_small():
+    """Which is exactly where an anti-reflection null or a fringe minimum sits."""
+    rng = np.random.default_rng(1)
+    dark = np.full(60_000, 1e-4)
+    spread = (noise.add_detector_noise(dark, rng) - dark).std()
+
+    assert spread == pytest.approx(5e-4, rel=0.1)
+
+
+def test_negative_noise_scales_are_rejected():
+    with pytest.raises(ValueError, match="non-negative"):
+        noise.add_detector_noise(_clean(THICK_FILM), np.random.default_rng(0), shot_scale=-1.0)
+
+
+# --- the corrupt() pipeline -------------------------------------------------
+
+
+def test_the_default_configuration_activates_at_least_three_effects():
+    """The acceptance criterion. §4.5 asks for three; the default runs four."""
+    active = noise.Corruption().active
+
+    assert len(active) >= 3
+    assert "detector noise" in active
+    assert "bandwidth" in active
+
+
+def test_every_effect_can_be_switched_off():
+    pristine = noise.Corruption(
+        roughness_nm=0.0, bandwidth_fwhm_nm=0.0, shot_scale=0.0, read_sigma=0.0
+    )
+
+    assert pristine.active == ()
+    observed = noise.corrupt(BLUR_WAVELENGTHS, _forward, 420.0, pristine)
+    assert np.allclose(observed, _forward(BLUR_WAVELENGTHS, 420.0), atol=1e-12)
+
+
+def test_the_stack_defects_are_applied_by_the_config_not_by_corrupt():
+    """Roughness and the interfacial layer change what the film *is*, so they
+    cannot be applied to a finished spectrum. Keeping them on the same object
+    stops `active` claiming an effect that nothing applies.
+    """
+    configuration = noise.Corruption(roughness_nm=5.0, interfacial_nm=2.0)
+    thicknesses, indices = configuration.stack_with_defects([420.0], [1.0, FILM, SUBSTRATE])
+
+    assert len(thicknesses) == 3
+    assert "roughness" in configuration.active
+    assert "interfacial layer" in configuration.active
+
+
+def test_corrupt_is_reproducible_and_stays_physical():
+    configuration = noise.Corruption(
+        spot_sigma_nm=8.0, wavelength_scale=1e-3, baseline_gain=1.02, baseline_offset=2e-3
+    )
+    first = noise.corrupt(
+        BLUR_WAVELENGTHS, _forward, 420.0, configuration, np.random.default_rng(3)
+    )
+    second = noise.corrupt(
+        BLUR_WAVELENGTHS, _forward, 420.0, configuration, np.random.default_rng(3)
+    )
+
+    assert np.array_equal(first, second)
+    assert first.shape == BLUR_WAVELENGTHS.shape
+    assert np.all(np.isfinite(first))
+
+
+def test_noise_is_applied_last_so_the_instrument_cannot_smooth_it():
+    """Order matters, and getting it wrong understates the uncertainty §8 models.
+
+    Blurring after adding noise would let the spectrometer average away noise the
+    detector has not generated yet. The observable consequence is that the
+    point-to-point scatter survives at close to its full size even with a wide
+    slit — which is what a real instrument shows.
+    """
+    wide_slit = noise.Corruption(roughness_nm=0.0, bandwidth_fwhm_nm=20.0, read_sigma=2e-3)
+    observed = noise.corrupt(BLUR_WAVELENGTHS, _forward, 420.0, wide_slit, np.random.default_rng(5))
+
+    smooth = noise.Corruption(
+        roughness_nm=0.0, bandwidth_fwhm_nm=20.0, shot_scale=0.0, read_sigma=0.0
+    )
+    reference = noise.corrupt(BLUR_WAVELENGTHS, _forward, 420.0, smooth)
+
+    scatter = np.std(np.diff(observed - reference))
+    assert scatter > 1.5e-3, "noise was smoothed away, so it was applied too early"
