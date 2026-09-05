@@ -39,6 +39,9 @@ __all__ = [
     "stack_r",
     "spectra",
     "stack_reflectance",
+    "stack_t",
+    "stack_transmittance",
+    "stack_absorptance",
 ]
 
 _CDTYPE = torch.complex128
@@ -493,3 +496,67 @@ def _as_row(n: torch.Tensor | float) -> torch.Tensor | float:
     if isinstance(n, torch.Tensor) and n.ndim == 1:
         return n.reshape(1, -1)
     return n
+
+
+def stack_t(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float = 0.0,
+    polarisation: str = "s",
+) -> torch.Tensor:
+    """Amplitude transmission coefficient of a stack, ``t = 1 / M[0,0]`` (§4.3)."""
+    matrix = stack_matrix(wavelength, thicknesses, indices, theta_0, polarisation)
+    return 1.0 / matrix[..., 0, 0]
+
+
+def stack_transmittance(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float = 0.0,
+    polarisation: str = "s",
+) -> torch.Tensor:
+    """Transmitted power fraction ``T``.
+
+    Not simply ``|t|²``: the transmitted wave travels in a different medium at a
+    different angle, so the amplitude must be converted to a power flux. The
+    correction is the ratio of the normal components of the Poynting vector, and
+    it differs between polarisations::
+
+        T_s = |t|² · Re(ñ_N cosθ_N) / Re(ñ_0 cosθ_0)
+        T_p = |t|² · Re(conj(ñ_N) cosθ_N) / Re(conj(ñ_0) cosθ_0)
+
+    Dropping that factor still yields a plausible number between 0 and 1 — it
+    would just quietly violate energy conservation, which is why the test that
+    matters here is ``R + T + A = 1`` rather than any bound on T alone.
+    """
+    amplitude = stack_t(wavelength, thicknesses, indices, theta_0, polarisation)
+    n_0, n_last = as_complex(indices[0]), as_complex(indices[-1])
+    cosines = stack_cosines(indices, theta_0)
+
+    if polarisation == "s":
+        flux = (n_last * cosines[-1]).real / (n_0 * cosines[0]).real
+    else:
+        flux = (n_last.conj() * cosines[-1]).real / (n_0.conj() * cosines[0]).real
+    return amplitude.abs() ** 2 * flux
+
+
+def stack_absorptance(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float = 0.0,
+    polarisation: str = "s",
+) -> torch.Tensor:
+    """Absorbed power fraction ``A = 1 − R − T``.
+
+    Never computed directly, which is the point: it is defined by conservation,
+    so a negative value means the model has created energy somewhere. That makes
+    it the sharpest available check on the whole stack product, and one that
+    reflectance alone cannot provide — ``R ≤ 1`` is a bound, ``R + T + A = 1`` is
+    an equality.
+    """
+    reflected = stack_reflectance(wavelength, thicknesses, indices, theta_0, polarisation)
+    transmitted = stack_transmittance(wavelength, thicknesses, indices, theta_0, polarisation)
+    return 1.0 - reflected - transmitted

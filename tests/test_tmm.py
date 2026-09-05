@@ -1055,3 +1055,356 @@ def test_the_reference_package_is_not_a_runtime_dependency():
     source = module.__loader__.get_source(module.__name__) or ""
     assert "import tmm" not in source
     assert "from tmm" not in source
+
+
+# --- energy conservation, DTFM-068 ------------------------------------------
+#
+# Added after E2 closed, from a sanity-check pass over the finished simulator.
+#
+# Every test before this one is about reflectance, so a whole class of error was
+# untested: a model that quietly created or destroyed energy would satisfy all of
+# them. R <= 1 is a bound; R + T + A = 1 is an equality, and equalities are much
+# harder to satisfy by accident.
+
+CONSERVING_STACKS = [
+    ("bare interface", [], [1.0, 1.52]),
+    ("single film", [300.0], [1.0, 1.46, 1.52]),
+    ("three layers", [120.0, 65.0, 200.0], [1.0, 1.38, 2.30, 1.46, 1.52]),
+    ("six layers", [80.0] * 6, [1.0, 1.46, 2.3, 1.46, 2.3, 1.46, 2.3, 1.52]),
+    ("high contrast", [90.0], [1.0, 2.6, 1.33]),
+]
+
+ABSORBING_STACKS = [
+    ("weak absorber", [400.0], [1.0, 1.5 + 0.02j, 1.52]),
+    ("strong absorber", [200.0], [1.0, 2.0 + 0.5j, 1.52]),
+    ("metal-like", [30.0], [1.0, 0.15 + 3.5j, 1.52]),
+    ("mixed", [80.0, 40.0, 150.0], [1.0, 1.46, 2.0 + 0.3j, 1.5 + 0.02j, 1.52]),
+]
+
+CONSERVATION_SPECTRUM = torch.linspace(400.0, 900.0, 120, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("theta_0", [0.0, 0.3, 0.7, 1.2])
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), CONSERVING_STACKS)
+def test_transparent_stacks_conserve_energy_exactly(name, thicknesses, indices, theta_0, pol):
+    """R + T = 1 with no absorption. An equality, so nothing can hide in it."""
+    reflected = pt.stack_reflectance(
+        CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol
+    )
+    transmitted = pt.stack_transmittance(
+        CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol
+    )
+
+    assert torch.allclose(reflected + transmitted, torch.ones_like(reflected), atol=1e-13), name
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("theta_0", [0.0, 0.6])
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), ABSORBING_STACKS)
+def test_absorbing_stacks_never_emit(name, thicknesses, indices, theta_0, pol):
+    """A = 1 − R − T must stay non-negative.
+
+    This is DTFM-010's branch fix confirmed by a completely independent route:
+    energy accounting rather than inspecting the root of a square root. A wrong
+    branch would show up here as a stack that emits more light than it received.
+    """
+    absorbed = pt.stack_absorptance(CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol)
+
+    assert torch.all(absorbed >= -1e-12), name
+    assert torch.all(absorbed <= 1.0 + 1e-12), name
+
+
+def test_absorption_grows_with_thickness_and_saturates():
+    """A thicker absorbing film absorbs more, up to the point where nothing
+    reaches the substrate and the answer stops depending on thickness.
+    """
+    thicknesses = (10.0, 50.0, 200.0, 1000.0, 5000.0, 20000.0)
+    absorbed = [
+        pt.stack_absorptance(
+            torch.tensor(550.0, dtype=torch.float64), [d], [1.0, 1.5 + 0.1j, 1.52], 0.0, "s"
+        ).item()
+        for d in thicknesses
+    ]
+
+    assert all(a < b for a, b in zip(absorbed[:-1], absorbed[1:], strict=True))
+
+    # Saturation is not at A = 1: once nothing reaches the substrate, everything
+    # not reflected at the front face is absorbed, so A tends to 1 - R_front.
+    transmitted = pt.stack_transmittance(
+        torch.tensor(550.0, dtype=torch.float64), [20000.0], [1.0, 1.5 + 0.1j, 1.52], 0.0, "s"
+    ).item()
+    assert transmitted < 1e-12, "the film should be opaque by 20 um"
+    assert absorbed[-1] == pytest.approx(absorbed[-2], abs=1e-3), "and A should have levelled off"
+
+
+def test_transmittance_matches_the_reference_package():
+    """The flux correction between polarisations is easy to get wrong and would
+    still give a plausible number, so it is checked against `tmm` directly.
+    """
+    for name, thicknesses, indices in CONSERVING_STACKS[1:]:
+        for pol in POLARISATIONS:
+            for theta_0 in (0.0, 0.5):
+                got = pt.stack_transmittance(
+                    torch.tensor(550.0, dtype=torch.float64), thicknesses, indices, theta_0, pol
+                ).item()
+                expected = tmm.coh_tmm(
+                    pol, list(indices), [np.inf, *thicknesses, np.inf], theta_0, 550.0
+                )["T"]
+
+                assert got == pytest.approx(expected, abs=1e-13), f"{name} {pol} {theta_0}"
+
+
+def test_a_perfect_antireflection_coating_transmits_everything():
+    """The quarter-wave null of DTFM-015, seen from the other side.
+
+    If R = 0 and the stack is transparent, T must be exactly 1 — which is the
+    same claim as the null but stated in transmitted power, and it fails if the
+    flux correction above is wrong even though the null itself would not.
+    """
+    n_sub = 2.30
+    n_film, d = quarter_wave_coating(n_sub)
+    wavelength = torch.tensor(DESIGN_WAVELENGTH, dtype=torch.float64)
+
+    transmitted = pt.stack_transmittance(wavelength, [d], [1.0, n_film, n_sub], 0.0, "s")
+
+    assert transmitted.item() == pytest.approx(1.0, abs=1e-12)
+
+
+# --- further sanity checks, DTFM-068 ----------------------------------------
+#
+# Each of these constrains the model in a way the earlier tests do not.
+
+
+def test_single_film_matches_the_airy_formula():
+    """A closed form that owes nothing to matrix algebra.
+
+    r = (r01 + r12 e^{2iδ}) / (1 + r01 r12 e^{2iδ})
+
+    This is the strongest available check on **matrix ordering**. Agreement with
+    the `tmm` package would not catch a transposed product, because that package
+    multiplies matrices too. This derivation does not.
+    """
+    wavelengths = torch.linspace(400.0, 800.0, 200, dtype=torch.float64)
+    thickness = 300.0
+
+    for n_0, n_1, n_2 in ((1.0, 1.46, 3.88), (1.0, 2.3, 1.52), (1.0, 1.5 + 0.05j, 3.88)):
+        for index, pol in enumerate(POLARISATIONS):
+            for theta_0 in (0.0, 0.5):
+                cosines = pt.stack_cosines([n_0, n_1, n_2], theta_0)
+                r_01 = pt.fresnel_r_from_cosines(
+                    pt.as_complex(n_0), pt.as_complex(n_1), cosines[0], cosines[1]
+                )[index]
+                r_12 = pt.fresnel_r_from_cosines(
+                    pt.as_complex(n_1), pt.as_complex(n_2), cosines[1], cosines[2]
+                )[index]
+                phase = torch.exp(2j * pt.layer_phase(n_1, thickness, wavelengths, cosines[1]))
+
+                airy = (r_01 + r_12 * phase) / (1.0 + r_01 * r_12 * phase)
+                matrix = pt.stack_r(wavelengths, [thickness], [n_0, n_1, n_2], theta_0, pol)
+
+                assert torch.allclose(matrix, airy, atol=1e-13)
+
+
+@pytest.mark.parametrize("factor", [0.5, 2.0, 7.3, 1000.0])
+def test_the_model_has_no_intrinsic_length_scale(factor):
+    """Maxwell's equations are scale invariant, so R(λ, d) = R(kλ, kd).
+
+    Only exact for a non-dispersive index, which is what makes it a pure
+    mathematics check rather than a physics one — and it is unusually sharp:
+    any stray absolute length, any unit confusion between nm and µm, breaks it.
+    """
+    wavelengths = torch.linspace(400.0, 800.0, 50, dtype=torch.float64)
+    thicknesses, indices = [220.0, 95.0], [1.0, 1.46, 2.3, 3.88]
+
+    base = pt.stack_reflectance(wavelengths, thicknesses, indices, 0.4, "s")
+    scaled = pt.stack_reflectance(
+        wavelengths * factor, [d * factor for d in thicknesses], indices, 0.4, "s"
+    )
+
+    assert torch.allclose(scaled, base, atol=1e-14)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(
+    ("name", "thicknesses", "indices"),
+    [
+        ("asymmetric transparent", [220.0, 95.0], [1.0, 1.46, 2.3, 1.52]),
+        ("absorbing", [180.0, 60.0], [1.0, 1.5 + 0.05j, 2.3, 1.52]),
+        ("metal-like", [25.0, 200.0], [1.0, 0.15 + 3.5j, 1.46, 1.52]),
+    ],
+)
+def test_transmittance_is_the_same_from_either_side(name, thicknesses, indices, pol):
+    """Reciprocity. Holds even when the stack is absorbing and asymmetric.
+
+    A genuinely different constraint from R + T + A = 1: conservation is about
+    one direction's books balancing, this is about the two directions agreeing.
+    """
+    wavelengths = torch.linspace(400.0, 800.0, 60, dtype=torch.float64)
+
+    forward = pt.stack_transmittance(wavelengths, thicknesses, indices, 0.0, pol)
+    backward = pt.stack_transmittance(
+        wavelengths, list(reversed(thicknesses)), list(reversed(indices)), 0.0, pol
+    )
+
+    assert torch.allclose(forward, backward, atol=1e-13), name
+
+
+def test_reflectance_is_side_independent_only_when_lossless():
+    """Unitarity, and it discriminates rather than merely holding.
+
+    For a lossless stack the 2x2 scattering matrix is unitary, which forces
+    |r| = |r'| however asymmetric the stack is — the reflectance is the same from
+    both sides even though the phases differ. Absorption breaks the unitarity and
+    the two sides diverge.
+
+    A test that only asserted "same" would pass on a model that ignored layer
+    order entirely; asserting *when* it differs closes that off.
+    """
+    wavelengths = torch.linspace(400.0, 800.0, 60, dtype=torch.float64)
+
+    def both_sides(thicknesses, indices):
+        forward = pt.stack_reflectance(wavelengths, thicknesses, indices, 0.0, "s")
+        backward = pt.stack_reflectance(
+            wavelengths, list(reversed(thicknesses)), list(reversed(indices)), 0.0, "s"
+        )
+        return (forward - backward).abs().max().item()
+
+    assert both_sides([220.0], [1.0, 1.46, 1.52]) < 1e-13
+    assert both_sides([120.0, 200.0, 80.0], [1.0, 1.46, 2.3, 1.38, 1.52]) < 1e-13
+    assert both_sides([220.0], [1.0, 1.5 + 0.05j, 1.52]) > 1e-3
+    assert both_sides([180.0, 60.0], [1.0, 1.5 + 0.08j, 2.3, 1.52]) > 1e-3
+
+    # the phases are not constrained, only the magnitudes
+    forward = pt.stack_r(wavelengths, [220.0], [1.0, 1.46, 1.52], 0.0, "s")
+    backward = pt.stack_r(wavelengths, [220.0], [1.52, 1.46, 1.0], 0.0, "s")
+    assert torch.allclose(forward.abs(), backward.abs(), atol=1e-14)
+    assert (forward.angle() - backward.angle()).abs().max() > 1.0
+
+
+def test_a_very_thick_film_averages_to_the_incoherent_result():
+    """Fringes too fine to resolve must average to the classical two-surface value
+
+        R_inc = R1 + T1² R2 / (1 − R1 R2)
+
+    which is derived by adding intensities and never mentions phase at all. The
+    coherent model has to reproduce it in the limit where the phase is scrambled.
+    """
+    n_0, n_1, n_2 = 1.0, 1.46, 1.52
+    front = ((n_0 - n_1) / (n_0 + n_1)) ** 2
+    back = ((n_1 - n_2) / (n_1 + n_2)) ** 2
+    incoherent = front + (1 - front) ** 2 * back / (1 - front * back)
+
+    wavelengths = torch.linspace(549.0, 551.0, 20001, dtype=torch.float64)
+    errors = []
+    for thickness in (2_000.0, 20_000.0, 200_000.0):
+        averaged = pt.stack_reflectance(
+            wavelengths, [thickness], [n_0, n_1, n_2], 0.0, "s"
+        ).mean().item()
+        errors.append(abs(averaged - incoherent))
+
+    assert errors[-1] < 1e-3
+    assert errors[-1] < errors[0], "should converge as more fringes fall in the window"
+
+
+def test_the_textbook_magnesium_fluoride_coating():
+    """MgF₂ on crown glass, the single-layer AR in every optics text.
+
+    Quoted at roughly 1.3% reflection against 4.3% bare. An external number this
+    project did not compute, unlike every other check in this file.
+    """
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+    n_mgf2, n_glass = 1.38, 1.52
+    quarter_wave = 550.0 / (4.0 * n_mgf2)
+
+    bare = pt.stack_reflectance(wavelength, [], [1.0, n_glass], 0.0, "s").item()
+    coated = pt.stack_reflectance(
+        wavelength, [quarter_wave], [1.0, n_mgf2, n_glass], 0.0, "s"
+    ).item()
+
+    assert bare == pytest.approx(0.043, abs=0.002)
+    assert coated == pytest.approx(0.013, abs=0.002)
+
+
+def test_an_ultra_thin_film_departs_only_quadratically_on_a_transparent_substrate():
+    """§5.2(c) sharpened: the insensitivity is second order, not first.
+
+    A film thinner than the wavelength barely changes the spectrum, which §5.2(c)
+    says makes the fit return a confident meaningless number. Measuring *how*
+    fast it vanishes gives a stronger statement than the spec makes.
+
+    At δ → 0 the stack amplitude reduces exactly to the bare-interface Fresnel
+    coefficient, and the leading correction is O(δ) — but for a transparent
+    substrate that correction is purely imaginary against a real r₀₂, so it
+    cancels in |r|² and the observable departure is **O(d²)**. Measured: exactly
+    100x per decade of thickness.
+
+    That matters for §5.2(c) and for the failure atlas. A quadratic vanishing is
+    far more hostile than a linear one: halving an already-thin film quarters the
+    signal rather than halving it, so the thin-film regime is worse than a naive
+    reading of "∂R/∂n → 0" suggests.
+    """
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+    bare = pt.stack_reflectance(wavelength, [], [1.0, 3.88], 0.0, "s").item()
+
+    departures = [
+        abs(pt.stack_reflectance(wavelength, [d], [1.0, 1.46, 3.88], 0.0, "s").item() - bare)
+        for d in (1.0, 0.1, 0.01, 1e-3)
+    ]
+
+    for coarse, fine in zip(departures[:-1], departures[1:], strict=True):
+        assert coarse / fine == pytest.approx(100.0, rel=0.01), "quadratic, not linear"
+
+
+def test_an_absorbing_substrate_makes_the_thin_film_easier_to_see():
+    """The converse, and the reason the quadratic result is not universal.
+
+    With an absorbing substrate r₀₂ is complex, the O(δ) correction no longer
+    lies purely along the imaginary axis, and it survives into |r|². The
+    departure becomes closer to first order in d — so a thin film on silicon is
+    genuinely more measurable than the same film on glass.
+    """
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+
+    def slope(substrate) -> float:
+        bare = pt.stack_reflectance(wavelength, [], [1.0, substrate], 0.0, "s").item()
+        values = [
+            abs(pt.stack_reflectance(wavelength, [d], [1.0, 1.46, substrate], 0.0, "s").item()
+                - bare)
+            for d in (1.0, 0.1, 0.01)
+        ]
+        return float(np.log10(np.mean([values[0] / values[1], values[1] / values[2]])))
+
+    assert slope(3.88) == pytest.approx(2.0, abs=0.05)
+    assert slope(3.88 + 0.02j) < 1.7, "absorption should make the departure shallower"
+
+
+def test_near_index_matched_interfaces_stay_finite():
+    """The degenerate regime of §5.2(a), pushed to absurdity.
+
+    Fresnel denominators nearly cancel here and DTFM-010 already found a
+    tolerance issue caused by it. The model must still return finite, bounded
+    numbers at index differences far below anything physical.
+    """
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+
+    for difference in (1e-2, 1e-6, 1e-12):
+        value = pt.stack_reflectance(
+            wavelength, [220.0], [1.0, 1.46, 1.46 + difference], 0.0, "s"
+        ).item()
+        assert np.isfinite(value) and 0.0 <= value <= 1.0
+
+
+@pytest.mark.parametrize("count", [10, 50, 200, 1000])
+def test_energy_survives_a_thousand_layer_matrix_product(count):
+    """Round-off accumulates through the chain, so conservation is the thing to
+    watch as stacks grow. A thousand layers still balances to float64 precision.
+    """
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+    thicknesses = [80.0] * count
+    indices = [1.0, *([1.46, 2.3] * (count // 2)), 1.52]
+
+    reflected = pt.stack_reflectance(wavelength, thicknesses, indices, 0.0, "s")
+    transmitted = pt.stack_transmittance(wavelength, thicknesses, indices, 0.0, "s")
+
+    assert (reflected + transmitted - 1.0).abs().item() < 1e-12
