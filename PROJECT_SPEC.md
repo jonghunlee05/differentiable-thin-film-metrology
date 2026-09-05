@@ -56,10 +56,11 @@ These were argued out already. Reopening them costs time and changes nothing.
 | **No novelty claimed on speed** | Would be immediately corrected by anyone in the field. §3a |
 | **MLP and 1D CNN only** | Architecture novelty is not what is being assessed. A transformer here signals inexperience, not ambition. §7.2 |
 | **Baseline before network, always** | An accuracy number with nothing to compare against is meaningless, and benchmarking against baselines is explicitly requested by the target roles. |
+| **Ellipsometry (Ψ, Δ), at oblique incidence** | Adopted at DTFM-028 on measured evidence: 5–100× better thickness precision, and the largest gains in the thin-film regime the project is written about. Requires ~70° incidence, so it **replaces** the earlier near-normal reflectance scope rather than extending it. §3 |
 
 ### Open decisions
 
-- **Ellipsometry (Ψ, Δ) — decide by week 3.** Cheap to add once both polarisations are tracked, and it substantially breaks the thickness–index degeneracy. Recommended. §3
+- ~~Ellipsometry (Ψ, Δ) — decide by week 3.~~ **Decided at DTFM-028: adopted.** See the standing decisions above and §3.
 - **The week 7½ fork** — finish the safe version, or push at an open question. Decide with real information about pace, not in advance. §12
 
 ### Status
@@ -131,7 +132,7 @@ DEPOSIT → COAT resist → EXPOSE → DEVELOP → ETCH → STRIP → CLEAN → 
 
 **Industrial framing.** Measurement throughput limits process control. Denser sampling would give a true thickness map rather than a scatter of points, revealing spatial non-uniformity that sparse sampling misses. The obstacle is inversion cost.
 
-**Technical framing.** Given a measured reflectance spectrum `R_obs(λ)`, recover the film parameters `θ = (d, n(λ))` that produced it. The forward map `θ → R` is cheap and exact. The inverse map is expensive (iterative) and, in identifiable regimes, non-unique.
+**Technical framing.** Given a measured spectrum, recover the film parameters `θ = (d, n(λ))` that produced it. Following DTFM-028 the measured quantity is the **ellipsometric pair `(Ψ(λ), Δ(λ))`** at oblique incidence, with reflectance `R(λ)` retained as a comparison case. The forward map `θ → (Ψ, Δ)` is cheap and exact. The inverse map is expensive (iterative) and, in identifiable regimes, non-unique.
 
 **The gap this project targets.** Classical inversion is slow but its uncertainty is rigorously characterised — the fit hands you a covariance matrix as a by-product, and there is a mature metrology discipline built on that. Learned inversion is fast but its uncertainty estimates are far weaker and far less studied. **The project's centre of gravity is closing that second gap, not the first.**
 
@@ -139,17 +140,38 @@ DEPOSIT → COAT resist → EXPOSE → DEVELOP → ETCH → STRIP → CLEAN → 
 
 **In scope**
 - Blanket dielectric films immediately after deposition, before lithography (§1.1)
-- Flat, unpatterned multilayer stacks at normal or near-normal incidence
-- Reflectance (intensity) measurement
+- Flat, unpatterned multilayer stacks at **oblique incidence, nominally 70°** (DTFM-028)
+- **Spectroscopic ellipsometry (Ψ, Δ)** as the primary measurement, with reflectance retained for comparison
 - Synthetic data generated from the project's own forward model
 - Thickness and dispersion-parameter recovery, with calibrated uncertainty
 - Comparison against a classical least-squares baseline
 
-**Recommended extension — decide by week 3**
+**Decided at DTFM-028: ellipsometry adopted, and the incidence angle changed with it**
 
-*Ellipsometry (Ψ, Δ).* Cheaper than it sounds: once the transfer matrix tracks both polarisations, which it does anyway, the ellipsometric quantities follow from `tan(Ψ)·e^(iΔ) = r_p / r_s` — a handful of lines. The gain is disproportionate. Ellipsometry provides two measured quantities per wavelength instead of one, is a ratio and therefore insensitive to source intensity drift, and **substantially breaks the thickness–index degeneracy that is the central difficulty of this project**.
+*Ellipsometry (Ψ, Δ).* The quantities follow from `tan(Ψ)·e^(iΔ) = r_p / r_s` once the transfer matrix tracks both polarisations, which it does. Two measured quantities per wavelength instead of one, and a ratio — so insensitive to source intensity drift, which removes §4.5's baseline-gain term entirely.
 
-It also unlocks a result not otherwise available: quantify with Fisher information *how much* the degeneracy shrinks moving from reflectance-only to full ellipsometry. That is an information-content question with a real number attached, and a better use of effort than adding another network architecture.
+**The measured gain, from the Fisher information.** Cramér–Rao bound on thickness, reflectance at 0.1% noise against an ellipsometer at 0.057°:
+
+| film | reflectance-only | ellipsometry | gain |
+|---|---|---|---|
+| 25 nm | 1.231 nm | 0.054 nm | **22.8×** |
+| 50 nm | 0.301 nm | 0.022 nm | 13.5× |
+| 200 nm | 0.167 nm | 0.024 nm | 7.1× |
+| 2000 nm | 0.599 nm | 0.129 nm | 4.6× |
+
+The gain is largest in the thin regime — which DTFM-068 measured as the hardest, and which §5.2(c), §8 and §10 are written about. The thickness–index correlation also falls, from −0.9992 to −0.9362 at 50 nm.
+
+**Two caveats found while deciding, both material.**
+
+*It is not "a handful of lines".* Ellipsometry carries **no information at normal incidence** — s and p coincide there, so `r_p/r_s` is constant. The gain only appears past ~30° and peaks near 70°:
+
+| angle | 0° | 10° | 20° | 30° | 45° | 60° | 70° |
+|---|---|---|---|---|---|---|---|
+| gain | none | 0.1× | 0.5× | 1.1× | 3.5× | 20× | 111× |
+
+So adopting it **replaces** the earlier near-normal scope rather than extending it. That is a real change, and it is why this is recorded as a standing decision rather than a footnote.
+
+*The gain is conditional on the instrument.* At 0.57° angular noise ellipsometry is **worse** than reflectance. Real instruments achieve 0.01–0.05°, so the assumption is sound, but it is an assumption and the report should say so.
 
 **Out of scope, with reasons**
 
@@ -243,7 +265,7 @@ r = M[1,0] / M[0,0]
 R = |r|²
 ```
 
-Compute independently for s and p; at normal incidence they coincide.
+Compute independently for s and p; at normal incidence they coincide — which is exactly why DTFM-028's ellipsometry requires oblique incidence, since `r_p/r_s` carries no information when the two are equal.
 
 ### 4.4 Dispersion models
 
