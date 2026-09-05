@@ -20,6 +20,8 @@ stack product where a dropped imaginary part would be hard to see.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 __all__ = [
@@ -32,6 +34,10 @@ __all__ = [
     "layer_matrix",
     "layer_phase",
     "reflectance",
+    "stack_cosines",
+    "stack_matrix",
+    "stack_r",
+    "stack_reflectance",
 ]
 
 _CDTYPE = torch.complex128
@@ -141,7 +147,20 @@ def fresnel_r(
     n_i, n_j = as_complex(n_i), as_complex(n_j)
     cos_i = torch.cos(as_complex(theta_i))
     cos_j = cos_theta_t(n_i, n_j, theta_i)
+    return fresnel_r_from_cosines(n_i, n_j, cos_i, cos_j)
 
+
+def fresnel_r_from_cosines(
+    n_i: torch.Tensor, n_j: torch.Tensor, cos_i: torch.Tensor, cos_j: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(r_s, r_p)`` from cosines already in hand, §4.2.
+
+    Inside a stack the cosine in each medium is obtained once from the Snell
+    invariant and reused. Recovering an angle with ``arccos`` and taking its
+    cosine again would be a round trip through a multivalued inverse — the
+    branch hazard of DTFM-010 in a second guise — so the cosines are passed
+    directly and the angle never reconstructed.
+    """
     r_s = (n_i * cos_i - n_j * cos_j) / (n_i * cos_i + n_j * cos_j)
     r_p = (n_j * cos_i - n_i * cos_j) / (n_j * cos_i + n_i * cos_j)
     return r_s, r_p
@@ -181,7 +200,13 @@ def fresnel_t(
     n_i, n_j = as_complex(n_i), as_complex(n_j)
     cos_i = torch.cos(as_complex(theta_i))
     cos_j = cos_theta_t(n_i, n_j, theta_i)
+    return fresnel_t_from_cosines(n_i, n_j, cos_i, cos_j)
 
+
+def fresnel_t_from_cosines(
+    n_i: torch.Tensor, n_j: torch.Tensor, cos_i: torch.Tensor, cos_j: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(t_s, t_p)`` from cosines already in hand. See :func:`fresnel_r_from_cosines`."""
     t_s = (2.0 * n_i * cos_i) / (n_i * cos_i + n_j * cos_j)
     t_p = (2.0 * n_i * cos_i) / (n_j * cos_i + n_i * cos_j)
     return t_s, t_p
@@ -211,8 +236,22 @@ def interface_matrix(
     polarisation : ``"s"`` or ``"p"``. The two are independent until they are
         combined into an intensity, and §4.3 requires both.
     """
-    r_s, r_p = fresnel_r(n_i, n_j, theta_i)
-    t_s, t_p = fresnel_t(n_i, n_j, theta_i)
+    n_i, n_j = as_complex(n_i), as_complex(n_j)
+    cos_i = torch.cos(as_complex(theta_i))
+    cos_j = cos_theta_t(n_i, n_j, theta_i)
+    return interface_matrix_from_cosines(n_i, n_j, cos_i, cos_j, polarisation)
+
+
+def interface_matrix_from_cosines(
+    n_i: torch.Tensor,
+    n_j: torch.Tensor,
+    cos_i: torch.Tensor,
+    cos_j: torch.Tensor,
+    polarisation: str,
+) -> torch.Tensor:
+    """``I_ij`` from cosines already in hand. See :func:`fresnel_r_from_cosines`."""
+    r_s, r_p = fresnel_r_from_cosines(n_i, n_j, cos_i, cos_j)
+    t_s, t_p = fresnel_t_from_cosines(n_i, n_j, cos_i, cos_j)
     r, t = _select_polarisation(polarisation, (r_s, r_p), (t_s, t_p))
 
     ones = torch.ones_like(r)
@@ -271,3 +310,93 @@ def _select_polarisation(
     if polarisation == "p":
         return s_and_p[1], other_s_and_p[1]
     raise ValueError(f"polarisation must be 's' or 'p', got {polarisation!r}")
+
+
+def stack_cosines(
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float,
+) -> list[torch.Tensor]:
+    """Cosine of the propagation angle in every medium of a stack.
+
+    Snell's law is a conservation law across the whole stack: ``ñ sinθ`` takes
+    the same value in every layer. So each cosine follows from the *ambient*
+    medium alone, in one step, rather than by chaining interface to interface —
+    which would accumulate both round-off and branch decisions.
+    """
+    n_0 = as_complex(indices[0])
+    theta_0 = as_complex(theta_0)
+    cos_0 = torch.cos(theta_0)
+    return [cos_0] + [cos_theta_t(n_0, n, theta_0) for n in indices[1:]]
+
+
+def stack_matrix(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float,
+    polarisation: str,
+) -> torch.Tensor:
+    """The §4.3 characteristic matrix of a stack.
+
+    ``M = I_01 · L_1 · I_12 · L_2 · … · I_{N−1,N}``
+
+    Parameters
+    ----------
+    wavelength : in the same units as ``thicknesses``; only the ratio enters.
+    thicknesses : the ``N − 1`` finite layers, ambient and substrate excluded —
+        both are semi-infinite and have no thickness to accumulate phase over.
+    indices : ``N + 1`` refractive indices, ambient first and substrate last.
+        Absorbing media are ``n + ik`` with ``k >= 0``.
+    theta_0 : angle of incidence in the ambient medium, radians.
+    polarisation : ``"s"`` or ``"p"``.
+
+    Returns shape ``(..., 2, 2)``, broadcasting over wavelength and over any
+    swept parameter.
+    """
+    if len(indices) < 2:
+        raise ValueError("a stack needs at least an ambient and a substrate medium")
+    if len(thicknesses) != len(indices) - 2:
+        raise ValueError(
+            f"got {len(thicknesses)} thicknesses for {len(indices)} media; expected "
+            f"{len(indices) - 2}. Ambient and substrate are semi-infinite and take no "
+            "thickness."
+        )
+
+    n = [as_complex(x) for x in indices]
+    cos = stack_cosines(indices, theta_0)
+
+    matrix = interface_matrix_from_cosines(n[0], n[1], cos[0], cos[1], polarisation)
+    for j in range(1, len(n) - 1):
+        layer = layer_matrix(n[j], thicknesses[j - 1], wavelength, cos[j])
+        boundary = interface_matrix_from_cosines(n[j], n[j + 1], cos[j], cos[j + 1], polarisation)
+        matrix = matrix @ layer @ boundary
+    return matrix
+
+
+def stack_r(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float = 0.0,
+    polarisation: str = "s",
+) -> torch.Tensor:
+    """Amplitude reflection coefficient of a stack, ``r = M[1,0] / M[0,0]`` (§4.3)."""
+    matrix = stack_matrix(wavelength, thicknesses, indices, theta_0, polarisation)
+    return matrix[..., 1, 0] / matrix[..., 0, 0]
+
+
+def stack_reflectance(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float = 0.0,
+    polarisation: str = "s",
+) -> torch.Tensor:
+    """Reflectance ``R = |r|²`` of a stack — the measured quantity of §1.
+
+    This is the forward model: film parameters in, spectrum out. Everything the
+    project does downstream calls it — the dataset generator of §7.1, the
+    classical fit of §6, and the reconstruction loss of §7.3, which is why it
+    must stay differentiable.
+    """
+    return stack_r(wavelength, thicknesses, indices, theta_0, polarisation).abs() ** 2
