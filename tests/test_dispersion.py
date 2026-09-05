@@ -338,3 +338,135 @@ def test_a_cauchy_film_drives_the_forward_model():
 def test_invalid_term_count_is_rejected():
     with pytest.raises(ValueError, match="terms must be 2 or 3"):
         dp.fit_cauchy("SiO2", terms=4)
+
+
+# --- Sellmeier dispersion, DTFM-021 ----------------------------------------
+#
+# Spec §4.4: "Transparent materials, wider range, physically better behaved."
+# Each of those three claims is tested below rather than taken on trust.
+
+
+@pytest.mark.parametrize("material", ["SiO2", "Si3N4", "TiO2"])
+def test_sellmeier_beats_cauchy_within_the_fitted_range(material):
+    """"Physically better behaved", measured.
+
+    Cauchy is Sellmeier expanded away from resonance and truncated, so it cannot
+    do better than the form it approximates given comparable freedom.
+    """
+    sellmeier = dp.fit_sellmeier(material, oscillators=2)
+    cauchy = dp.fit_cauchy(material, terms=3)
+
+    assert sellmeier.rms_residual < cauchy.rms_residual
+
+
+@pytest.mark.parametrize("material", ["SiO2", "Si3N4"])
+def test_sellmeier_extrapolates_better_than_cauchy(material):
+    """"Wider range", and the sharper form of the claim.
+
+    Both models are fitted on 500-700 nm, then asked about wavelengths they
+    never saw. Keeping the pole rather than expanding it away is what lets
+    Sellmeier stay honest outside the fitted window — and this is the property
+    that matters, since §7.1's prior will sample films the fit never covered.
+    """
+    fit_range = np.linspace(500.0, 700.0, 100)
+    low, high = dp.material_range_nm(material)
+    wide = np.linspace(max(low, 250.0), min(high, 2500.0), 400)
+    n_true, _ = dp.load_nk(material, wide)
+
+    cauchy_error = np.abs(dp.cauchy_n(dp.fit_cauchy(material, fit_range), wide) - n_true).max()
+    sellmeier_error = np.abs(
+        dp.sellmeier_n(dp.fit_sellmeier(material, fit_range, oscillators=2), wide) - n_true
+    ).max()
+
+    assert sellmeier_error < cauchy_error / 3.0
+
+
+def test_the_fitted_resonance_matches_the_published_one():
+    """The coefficients mean something, unlike Cauchy's.
+
+    Luke's Si₃N₄ Sellmeier coefficient is C₁ = 0.1353406 µm² — a resonance at
+    135.3 nm. Fitting only 400-800 nm data, where that pole is far outside the
+    window and never directly observed, recovers it. A curve-fitting exercise
+    would not.
+    """
+    fit = dp.fit_sellmeier("Si3N4", oscillators=2)
+    ultraviolet = min(fit.resonances_nm)
+
+    assert ultraviolet == pytest.approx(135.3, rel=0.05)
+
+
+@pytest.mark.parametrize("material", ["SiO2", "Si3N4", "TiO2"])
+def test_poles_stay_outside_the_fitted_window(material):
+    """A pole inside the data is a division by zero mid-range.
+
+    The model would blow up between two measured points rather than describe
+    anything, so each oscillator is confined to one side of the window.
+    """
+    fit = dp.fit_sellmeier(material, oscillators=2)
+    low, high = fit.range_nm
+
+    for resonance in fit.resonances_nm:
+        assert resonance < low or resonance > high
+
+
+def test_titania_needs_two_ultraviolet_poles_not_the_textbook_uv_ir_pair():
+    """A regression guard on the multi-start, and the physics behind it.
+
+    The obvious starting guess — one UV electronic resonance, one IR lattice
+    vibration — is right for SiO₂ and Si₃N₄ and wrong for TiO₂, whose band gap
+    sits at 385 nm and which has no useful infrared pole over the visible.
+    Started from that guess alone the optimiser drives the second oscillator's
+    strength to zero and returns a fit 86× worse, reporting nothing amiss.
+
+    §6 prescribes multi-start for precisely this failure. Without it this
+    assertion fails at 4.3e-03.
+    """
+    fit = dp.fit_sellmeier("TiO2", oscillators=2)
+
+    assert fit.rms_residual < 1e-4
+    assert all(b > 0.0 for b in fit.b), "an oscillator collapsed to zero strength"
+    assert all(r < 400.0 for r in fit.resonances_nm)
+
+
+@pytest.mark.parametrize("material", ["SiO2", "Si3N4"])
+def test_a_second_oscillator_improves_the_fit(material):
+    one = dp.fit_sellmeier(material, oscillators=1)
+    two = dp.fit_sellmeier(material, oscillators=2)
+
+    assert two.rms_residual < one.rms_residual
+
+
+def test_sellmeier_refuses_absorbing_materials():
+    """Its poles mark where absorption is without describing it — a real index
+    with no k. §4.4 sends absorbers to a Lorentz oscillator (DTFM-022).
+    """
+    with pytest.raises(ValueError, match="transparent"):
+        dp.fit_sellmeier("Si")
+
+
+@pytest.mark.parametrize("material", ["SiO2", "Si3N4", "TiO2"])
+def test_the_fitted_model_reproduces_its_data(material):
+    wavelengths = np.linspace(420.0, 780.0, 73)
+    fit = dp.fit_sellmeier(material, wavelengths, oscillators=2)
+    n_data, _ = dp.load_nk(material, wavelengths)
+
+    assert np.allclose(dp.sellmeier_n(fit, wavelengths), n_data, atol=1e-3)
+    assert np.all(dp.sellmeier_n(fit, wavelengths) > 1.0)
+
+
+def test_sellmeier_is_differentiable_in_its_coefficients():
+    """§7.1 samples dispersion coefficients; §7.3 backpropagates through them."""
+    fit = dp.fit_sellmeier("SiO2", oscillators=2)
+    b = torch.tensor(fit.b, dtype=torch.float64, requires_grad=True)
+    c = torch.tensor(fit.c, dtype=torch.float64, requires_grad=True)
+    wavelengths = torch.linspace(450.0, 750.0, 50, dtype=torch.float64)
+
+    dp.sellmeier_n((b, c), wavelengths).sum().backward()
+
+    assert torch.all(torch.isfinite(b.grad)) and torch.any(b.grad != 0.0)
+    assert torch.all(torch.isfinite(c.grad)) and torch.any(c.grad != 0.0)
+
+
+def test_at_least_one_oscillator_is_required():
+    with pytest.raises(ValueError, match="at least one oscillator"):
+        dp.fit_sellmeier("SiO2", oscillators=0)

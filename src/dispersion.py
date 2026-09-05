@@ -29,6 +29,9 @@ __all__ = [
     "fit_cauchy",
     "load_nk",
     "material_range_nm",
+    "SellmeierFit",
+    "fit_sellmeier",
+    "sellmeier_n",
 ]
 
 _DATA_ROOT = pathlib.Path(__file__).resolve().parent.parent / "data" / "refractiveindex"
@@ -304,3 +307,193 @@ def fit_cauchy(
         range_nm=(float(wavelengths_nm.min()), float(wavelengths_nm.max())),
         max_k_in_range=max_k,
     )
+
+
+# --- Sellmeier dispersion, DTFM-021 ----------------------------------------
+
+
+@dataclass(frozen=True)
+class SellmeierFit:
+    """A Sellmeier model fitted to measured data, with its residuals.
+
+    ``n² = 1 + Σ Bᵢ λ²/(λ² − Cᵢ)`` in the form §4.4 gives it, with **wavelength
+    in micrometres**. Each ``Cᵢ`` is the *square* of a resonance wavelength, so
+    ``sqrt(Cᵢ)`` is where the material absorbs — a coefficient that means
+    something physical, unlike Cauchy's, which are only curve-fitting terms.
+    """
+
+    b: tuple[float, ...]
+    c: tuple[float, ...]
+    rms_residual: float
+    max_residual: float
+    range_nm: tuple[float, float]
+    max_k_in_range: float
+
+    @property
+    def resonances_nm(self) -> tuple[float, ...]:
+        """Where the fitted oscillators sit, in nanometres."""
+        return tuple(float(np.sqrt(abs(c)) * 1e3) for c in self.c)
+
+
+def sellmeier_n(coefficients, wavelengths_nm):
+    """Evaluate ``n² = 1 + Σ Bᵢ λ²/(λ² − Cᵢ)``.
+
+    Parameters
+    ----------
+    coefficients : a :class:`SellmeierFit`, or a ``(B, C)`` pair of sequences —
+        including torch tensors carrying ``requires_grad``.
+
+    Plain arithmetic, so it accepts numpy arrays or torch tensors and stays
+    differentiable, for the same reason :func:`cauchy_n` does.
+    """
+    if isinstance(coefficients, SellmeierFit):
+        b_values, c_values = coefficients.b, coefficients.c
+    else:
+        b_values, c_values = coefficients
+
+    wavelength_um_squared = (wavelengths_nm * 1e-3) ** 2
+    n_squared = 1.0 + 0.0 * wavelength_um_squared
+    for b, c in zip(b_values, c_values, strict=True):
+        n_squared = n_squared + b * wavelength_um_squared / (wavelength_um_squared - c)
+    return n_squared**0.5
+
+
+def fit_sellmeier(
+    material: str,
+    wavelengths_nm: NDArray | list[float] | None = None,
+    *,
+    oscillators: int = 2,
+    allow_absorbing: bool = False,
+) -> SellmeierFit:
+    """Fit §4.4's Sellmeier model to the measured data for ``material``.
+
+    Unlike Cauchy this is **nonlinear** in the coefficients — each ``Cᵢ`` sits in
+    a denominator — so it needs an iterative solve and a starting guess. The
+    guess places resonances in the ultraviolet and the infrared, which is where
+    dielectrics actually have them: an electronic absorption below the visible
+    and a lattice vibration above it.
+
+    Notes
+    -----
+    **Why this holds where Cauchy fails.** Cauchy is Sellmeier expanded far from
+    resonance and truncated, so its accuracy is bounded by how far the expansion
+    has been pushed. Sellmeier keeps the pole, so approaching an absorption edge
+    from the transparent side it stays well behaved where the expansion has
+    already diverged. That is §4.4's "wider range, physically better behaved" in
+    mechanical terms, and DTFM-020's measured residuals are the other half of it.
+
+    It still describes only transparent materials: a real ``n`` with no ``k``.
+    The pole is where absorption *is*, not a description of it — for that, §4.4
+    sends you to a Lorentz oscillator, which gives the pole a width (DTFM-022).
+    """
+    if oscillators < 1:
+        raise ValueError(f"need at least one oscillator, got {oscillators}")
+
+    low_nm, high_nm = material_range_nm(material)
+    if wavelengths_nm is None:
+        wavelengths_nm = np.linspace(max(low_nm, 400.0), min(high_nm, 800.0), 200)
+    wavelengths_nm = np.asarray(wavelengths_nm, dtype=float)
+
+    n_data, k_data = load_nk(material, wavelengths_nm)
+    max_k = float(np.max(k_data))
+    if max_k > 1e-3 and not allow_absorbing:
+        raise ValueError(
+            f"{material} absorbs over {wavelengths_nm.min():.0f}-{wavelengths_nm.max():.0f} nm "
+            f"(max k = {max_k:.3g}). Sellmeier describes a transparent material — its poles mark "
+            "where absorption is, without describing it. Use a Lorentz oscillator (§4.4), or pass "
+            "allow_absorbing=True to demonstrate the failure."
+        )
+
+    wavelength_um = wavelengths_nm * 1e-3
+
+    def residual(parameters: NDArray) -> NDArray:
+        b_values = parameters[:oscillators]
+        c_values = parameters[oscillators:]
+        return sellmeier_n((b_values, c_values), wavelengths_nm) - n_data
+
+    best_solution, best_cost = None, np.inf
+    for poles_um in _sellmeier_starts(oscillators):
+        lower, upper = _pole_bounds(poles_um, wavelength_um, oscillators)
+        initial = np.concatenate([np.full(oscillators, 1.0), np.array(poles_um) ** 2])
+        initial = np.clip(initial, lower + 1e-12, upper - 1e-12)
+
+        solution = _least_squares(residual, initial, lower, upper)
+        cost = float(np.sum(residual(solution) ** 2))
+        if cost < best_cost:
+            best_solution, best_cost = solution, cost
+
+    solution = best_solution
+    b_fitted = tuple(float(x) for x in solution[:oscillators])
+    c_fitted = tuple(float(x) for x in solution[oscillators:])
+
+    final = residual(solution)
+    return SellmeierFit(
+        b=b_fitted,
+        c=c_fitted,
+        rms_residual=float(np.sqrt(np.mean(final**2))),
+        max_residual=float(np.max(np.abs(final))),
+        range_nm=(float(wavelengths_nm.min()), float(wavelengths_nm.max())),
+        max_k_in_range=max_k,
+    )
+
+
+def _sellmeier_starts(oscillators: int) -> list[tuple[float, ...]]:
+    """Candidate pole positions, in micrometres, for the multi-start.
+
+    A fixed list rather than random draws, so the fit is reproducible (§15).
+
+    The obvious physical guess — one electronic resonance in the ultraviolet and
+    one lattice vibration in the infrared — is right for SiO2 and Si3N4 and
+    *wrong* for TiO2, whose band gap sits at 385 nm and which has no useful
+    infrared pole in this window. Started from the obvious guess alone, the
+    optimiser drives the second oscillator's strength to zero and returns a fit
+    86x worse than it needs to be, while reporting nothing amiss. §6 prescribes
+    multi-start for exactly this reason, and this is the same failure in
+    miniature.
+    """
+    ultraviolet = [0.05, 0.10, 0.15, 0.20, 0.25, 0.32]
+    infrared = [8.0, 12.0, 20.0]
+    if oscillators == 1:
+        return [(uv,) for uv in ultraviolet]
+
+    starts: list[tuple[float, ...]] = []
+    for uv in ultraviolet[:4]:
+        starts.append((uv, infrared[0]))                       # UV + IR: the textbook pair
+        starts.append((uv, ultraviolet[-1]))                   # two UV poles: wide-gap oxides
+    for extra in range(2, oscillators):
+        starts = [s + (infrared[min(extra - 2, 2)],) for s in starts]
+    return starts
+
+
+def _pole_bounds(
+    poles_um: tuple[float, ...], wavelength_um: NDArray, oscillators: int
+) -> tuple[NDArray, NDArray]:
+    """Keep every pole outside the fitted window.
+
+    A pole inside the window is a division by zero in the middle of the data:
+    the model would blow up mid-range rather than describe anything. Each
+    oscillator is confined to whichever side of the window it started on.
+    """
+    below = (wavelength_um.min() * 0.98) ** 2
+    above = (wavelength_um.max() * 1.02) ** 2
+
+    lower = np.concatenate([np.zeros(oscillators), np.full(oscillators, 1e-8)])
+    upper = np.concatenate([np.full(oscillators, np.inf), np.full(oscillators, np.inf)])
+    for i, pole in enumerate(poles_um):
+        if pole**2 < below:
+            upper[oscillators + i] = below
+        else:
+            lower[oscillators + i] = above
+    return lower, upper
+
+
+def _least_squares(residual, initial: NDArray, lower: NDArray, upper: NDArray) -> NDArray:
+    """Bounded nonlinear least squares, imported lazily.
+
+    scipy is a heavier import than the rest of this module needs, and §6 is where
+    it becomes central — keeping it local means `load_nk` and the Cauchy fit stay
+    dependent only on numpy.
+    """
+    from scipy.optimize import least_squares
+
+    return least_squares(residual, initial, bounds=(lower, upper), method="trf").x
