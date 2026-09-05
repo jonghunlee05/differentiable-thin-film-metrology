@@ -1470,3 +1470,125 @@ def test_a_rough_absorbing_film_keeps_its_absorption():
 
     absorbed = pt.stack_absorptance(wavelengths, thicknesses, indices, 0.0, "s")
     assert torch.all(absorbed > 0.0)
+
+
+# --- ellipsometry, DTFM-029 --------------------------------------------------
+#
+# Spec §3, adopted at DTFM-028. tan(Ψ)·e^{iΔ} = r_p / r_s.
+
+
+def test_psi_and_delta_reproduce_their_defining_relation():
+    """The definition, checked rather than assumed: tan(Ψ)·e^{iΔ} must rebuild ρ."""
+    wavelengths = torch.linspace(400.0, 800.0, 120, dtype=torch.float64)
+    angle = np.radians(70.0)
+    thicknesses, indices = [300.0], [1.0, 1.46, 3.88]
+
+    ratio = pt.stack_rho(wavelengths, thicknesses, indices, angle)
+    psi, delta = pt.stack_psi_delta(wavelengths, thicknesses, indices, angle)
+    rebuilt = torch.tan(psi) * torch.exp(1j * delta)
+
+    assert torch.allclose(rebuilt, ratio, atol=1e-13)
+
+
+def test_at_normal_incidence_ellipsometry_carries_no_information():
+    """The physics behind DTFM-028's angle change, asserted.
+
+    At θ=0 there is no plane of incidence, s and p coincide, and the §4.2 sign
+    convention makes r_p = −r_s exactly. So ρ = −1 for **every** film: Ψ = 45°
+    and Δ = 180°, regardless of thickness or index.
+
+    A measurement whose value does not depend on the parameters cannot estimate
+    them. That is why adopting ellipsometry required moving off normal
+    incidence, and it is a stronger statement than "the gain is small".
+    """
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+
+    for thickness in (50.0, 300.0, 1200.0):
+        for index in (1.38, 1.46, 2.30):
+            psi, delta = pt.stack_psi_delta(wavelength, [thickness], [1.0, index, 3.88], 0.0)
+            assert psi.item() == pytest.approx(np.pi / 4, abs=1e-12)
+            assert abs(delta.item()) == pytest.approx(np.pi, abs=1e-12)
+
+
+def test_away_from_normal_incidence_the_angles_do_depend_on_the_film():
+    """Guards the test above from passing on a constant."""
+    wavelength = torch.tensor(550.0, dtype=torch.float64)
+    angle = np.radians(70.0)
+
+    first = pt.stack_psi_delta(wavelength, [300.0], [1.0, 1.46, 3.88], angle)
+    second = pt.stack_psi_delta(wavelength, [420.0], [1.0, 1.46, 3.88], angle)
+
+    assert abs(first[0].item() - second[0].item()) > 1e-3
+    assert abs(first[1].item() - second[1].item()) > 1e-3
+
+
+def test_the_angles_stay_in_their_defined_ranges():
+    """Ψ ∈ [0, π/2] as an amplitude ratio; Δ ∈ (−π, π] as a phase."""
+    wavelengths = torch.linspace(400.0, 800.0, 200, dtype=torch.float64)
+
+    for angle_deg in (30.0, 50.0, 70.0, 85.0):
+        psi, delta = pt.stack_psi_delta(
+            wavelengths, [300.0, 80.0], [1.0, 1.46, 2.3, 3.88], np.radians(angle_deg)
+        )
+        assert torch.all((psi >= 0.0) & (psi <= np.pi / 2))
+        assert torch.all((delta >= -np.pi) & (delta <= np.pi))
+
+
+def test_the_ratio_is_immune_to_source_intensity_drift():
+    """Why §3 calls ellipsometry ratio-based, made concrete.
+
+    A lamp drifting in brightness scales r_p and r_s together, so ρ is unchanged
+    — which removes §4.5's baseline-gain term entirely. DTFM-025 measured that
+    term as correlating above 0.99 with refractive index, so this is not a minor
+    convenience.
+    """
+    wavelengths = torch.linspace(400.0, 800.0, 60, dtype=torch.float64)
+    angle = np.radians(70.0)
+    args = ([300.0], [1.0, 1.46, 3.88], angle)
+
+    psi, delta = pt.stack_psi_delta(wavelengths, *args)
+    r_s = pt.stack_r(wavelengths, *args, "s")
+    r_p = pt.stack_r(wavelengths, *args, "p")
+
+    for gain in (0.8, 1.0, 1.25):
+        drifted = (gain * r_p) / (gain * r_s)
+        assert torch.allclose(torch.atan(drifted.abs()), psi, atol=1e-14)
+        assert torch.allclose(torch.atan2(drifted.imag, drifted.real), delta, atol=1e-14)
+
+
+def test_delta_uses_the_full_circle():
+    """atan2 rather than atan(imag/real).
+
+    The half-plane version folds Δ and Δ−π together, and it is the sign of Δ
+    that distinguishes a film above its quarter-wave point from one below it.
+    """
+    wavelengths = torch.linspace(400.0, 800.0, 400, dtype=torch.float64)
+    _, delta = pt.stack_psi_delta(
+        wavelengths, [900.0], [1.0, 1.46, 3.88], np.radians(70.0)
+    )
+
+    assert delta.min().item() < -0.5
+    assert delta.max().item() > 0.5
+
+
+def test_ellipsometry_is_differentiable():
+    """§7.3 backpropagates through whatever the generator produced."""
+    thickness = torch.tensor(300.0, dtype=torch.float64, requires_grad=True)
+    wavelengths = torch.linspace(400.0, 800.0, 60, dtype=torch.float64)
+
+    psi, delta = pt.stack_psi_delta(
+        wavelengths, [thickness], [1.0, 1.46, 3.88], np.radians(70.0)
+    )
+    (psi.sum() + delta.sum()).backward()
+
+    assert torch.isfinite(thickness.grad) and thickness.grad.item() != 0.0
+
+
+def test_the_informativeness_guard_matches_the_measured_gains():
+    """DTFM-028 measured the gain as 0.1x at 10°, 1.1x at 30° and 111x at 70°,
+    so a configuration below about 30° is almost certainly a mistake.
+    """
+    assert not pt.psi_delta_is_informative(0.0)
+    assert not pt.psi_delta_is_informative(np.radians(20.0))
+    assert pt.psi_delta_is_informative(np.radians(30.0))
+    assert pt.psi_delta_is_informative(np.radians(70.0))

@@ -29,6 +29,7 @@ __all__ = [
     "Corruption",
     "add_backside_reflection",
     "add_detector_noise",
+    "add_ellipsometer_noise",
     "add_interfacial_layer",
     "add_surface_roughness",
     "apply_spectrometer_bandwidth",
@@ -470,3 +471,43 @@ def corrupt(
     return add_detector_noise(
         spectrum, rng, shot_scale=corruption.shot_scale, read_sigma=corruption.read_sigma
     )
+
+
+def add_ellipsometer_noise(
+    psi,
+    delta,
+    rng: np.random.Generator,
+    *,
+    sigma_rad: float = 1e-3,
+):
+    """Angular noise on ``(Ψ, Δ)`` — the ellipsometric analogue of §4.5's detector noise.
+
+    Different in kind from :func:`add_detector_noise`, not merely in scale.
+    Reflectance noise is dominated by photon statistics and scales as ``sqrt(R)``.
+    An ellipsometer measures a *polarisation state*, and its uncertainty is
+    angular and roughly signal-independent — set by the analyser's angular
+    resolution and the polariser extinction ratio rather than by photon count.
+
+    The default 1e-3 rad is 0.057°, a good but unexceptional instrument.
+    DTFM-028 measured the whole ellipsometry advantage as conditional on this
+    number: at 0.57° the technique is *worse* than reflectometry.
+
+    Baseline drift is deliberately absent. ``ρ = r_p/r_s`` is a ratio, so a
+    source that drifts in intensity scales both and cancels — which removes the
+    §4.5 term DTFM-025 measured as correlating above 0.99 with refractive index.
+    That cancellation is a real advantage of the technique and should not be
+    modelled away by adding a gain term here out of symmetry with reflectance.
+    """
+    if sigma_rad < 0.0:
+        raise ValueError(f"sigma must be non-negative, got {sigma_rad}")
+
+    psi = np.asarray(psi, dtype=float)
+    delta = np.asarray(delta, dtype=float)
+    noisy_psi = psi + rng.normal(0.0, sigma_rad, psi.shape)
+    noisy_delta = delta + rng.normal(0.0, sigma_rad, delta.shape)
+
+    # Ψ is an amplitude ratio in [0, π/2] and Δ wraps on the circle. Noise must
+    # respect both, or a sample near a boundary becomes physically impossible.
+    noisy_psi = np.clip(noisy_psi, 0.0, np.pi / 2)
+    noisy_delta = (noisy_delta + np.pi) % (2 * np.pi) - np.pi
+    return noisy_psi, noisy_delta

@@ -43,6 +43,9 @@ __all__ = [
     "stack_t",
     "stack_transmittance",
     "stack_absorptance",
+    "stack_psi_delta",
+    "stack_rho",
+    "psi_delta_is_informative",
 ]
 
 _CDTYPE = torch.complex128
@@ -565,3 +568,64 @@ def stack_absorptance(
     reflected = stack_reflectance(wavelength, thicknesses, indices, theta_0, polarisation)
     transmitted = stack_transmittance(wavelength, thicknesses, indices, theta_0, polarisation)
     return 1.0 - reflected - transmitted
+
+
+def stack_rho(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float,
+) -> torch.Tensor:
+    """The ellipsometric ratio ``ρ = r_p / r_s`` (§3).
+
+    Being a ratio is the point, not an implementation detail. A source that
+    drifts in intensity scales ``r_p`` and ``r_s`` identically and cancels, which
+    removes §4.5's baseline-gain term from the measurement entirely — and that
+    term was the one DTFM-025 measured as correlating above 0.99 with the
+    refractive index.
+    """
+    r_s = stack_r(wavelength, thicknesses, indices, theta_0, "s")
+    r_p = stack_r(wavelength, thicknesses, indices, theta_0, "p")
+    return r_p / r_s
+
+
+def stack_psi_delta(
+    wavelength: torch.Tensor | float,
+    thicknesses: Sequence[torch.Tensor | float],
+    indices: Sequence[torch.Tensor | float],
+    theta_0: torch.Tensor | float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ellipsometric angles ``(Ψ, Δ)`` from ``tan(Ψ)·e^{iΔ} = r_p / r_s`` (§3).
+
+    Ψ in ``[0, π/2]`` is the amplitude ratio, Δ in ``(−π, π]`` the phase
+    difference between the two polarisations. Two measured quantities per
+    wavelength rather than one, which is where the information gain measured in
+    DTFM-028 comes from.
+
+    Δ uses ``atan2`` rather than ``atan(imag/real)`` so the full circle is
+    covered: the half-plane version would fold Δ and −Δ together, and it is the
+    sign of Δ that distinguishes a film above its quarter-wave point from one
+    below it.
+
+    Returns nothing useful at normal incidence, and that is physics rather than
+    a limitation — s and p coincide there, so ρ is a constant and carries no
+    information about the film. DTFM-028 measured the gain against angle and
+    adopted 70° for this reason; see :func:`psi_delta_is_informative`.
+    """
+    ratio = stack_rho(wavelength, thicknesses, indices, theta_0)
+    return torch.atan(ratio.abs()), torch.atan2(ratio.imag, ratio.real)
+
+
+def psi_delta_is_informative(theta_0: torch.Tensor | float, minimum_degrees: float = 30.0) -> bool:
+    """Whether the incidence angle is oblique enough for ellipsometry to inform.
+
+    DTFM-028's measurement: the gain over reflectance is 0.1x at 10°, 0.5x at
+    20°, 1.1x at 30° and 111x at 70°. Below about 30° an ellipsometric
+    measurement is worse than simply measuring reflectance, so a configuration
+    that lands there is almost certainly a mistake rather than a choice.
+    """
+    angle = float(theta_0.item()) if isinstance(theta_0, torch.Tensor) else float(theta_0)
+    # Compared in radians rather than converting the angle to degrees: the round
+    # trip degrees(radians(30.0)) lands on 29.999999999999996 and would reject a
+    # threshold value that was meant to be accepted.
+    return abs(angle) >= np.radians(minimum_degrees) - 1e-12
