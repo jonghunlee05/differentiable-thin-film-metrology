@@ -356,7 +356,8 @@ class MultiStartResult:
 
     §6: "Handle multimodality with multi-start from many initial guesses; record
     where each converges. That landscape *is* the fringe-order ambiguity made
-    visible."
+    visible." (The spec's name for it is inexact — see
+    ``Implementation-Notes.md`` §18 — but the instruction is right.)
 
     So the losing fits are kept. They are the evidence that the ambiguity is
     real, they are what the landscape figure is drawn from, and DTFM-033 needs
@@ -429,27 +430,33 @@ class MultiStartResult:
 
 
 def multi_start_grid(
-    count: int = 12, prior: gen.Prior | None = None, *, spacing: str = "uniform"
+    count: int = 20, prior: gen.Prior | None = None, *, spacing: str = "uniform"
 ) -> NDArray[np.float64]:
     """Thickness starting points spanning the prior's support.
 
     **Spaced uniformly in thickness, not the way the prior samples**, and that
-    is the whole substance of this function.
+    is the substance of this function.
 
     The prior is log-uniform for a reason §7.1 sets out: each decade of thickness
     deserves equal weight because the thin regime is where the problem is hard.
-    Seeding the *search* the same way is the obvious move and it is wrong. The
-    minima are not spread through the prior — they are periodic in thickness,
-    one per fringe, at
+    Seeding the *search* the same way is the obvious move and it is wrong. What a
+    start has to do is land inside the **basin of attraction** of the true
+    minimum, and those basins are spread evenly in thickness rather than in its
+    logarithm. Measured, by sweeping starts 10 nm apart and recording which reach
+    the truth:
 
-        Δd = λ / (2 n cos θ_t) ≈ 600 / (2 × 1.46 × 0.765) ≈ 268 nm
+    | film | widest contiguous run of starts that reach it |
+    |---|---|
+    | 65 nm | 160 nm |
+    | 150 nm | 230 nm |
+    | **420 nm** | **110 nm** |
+    | 900 nm | 250 nm |
+    | 1500 nm | 250 nm |
+    | 1900 nm | 240 nm |
 
-    for this band and geometry. That period does not care about thickness, so
-    over 20-2000 nm there are about 7 basins, evenly spread. A log grid puts half
-    its starts below 250 nm and leaves a 470 nm gap above 1500 — wider than a
-    fringe, so whole basins are never entered.
-
-    Measured, on 30 / 65 / 150 / 420 / 900 / 1500 / 1900 nm films:
+    A log grid puts half its starts below 250 nm and leaves a 470 nm gap above
+    1500 nm — four times the narrowest basin, so whole regions are entered by no
+    start at all:
 
     | start spacing | starts | films recovered |
     |---|---|---|
@@ -461,8 +468,29 @@ def multi_start_grid(
     ``spacing`` is kept as an argument so that comparison stays runnable rather
     than being a claim in a docstring.
 
-    The default of 12 follows from the period: 12 starts over 1980 nm sit 165 nm
-    apart, comfortably inside 268 nm, so every basin is entered at least once.
+    **Where the default comes from.** Two lines of evidence, and they agree.
+    Coverage requires the spacing to be no wider than the narrowest basin, 110 nm,
+    giving ``count ≥ 1980 × 0.96 / 110 ≈ 18``. Measured recovery on 40 films drawn
+    from the prior:
+
+    | starts | spacing | films recovered |
+    |---|---|---|
+    | 8 | 238 nm | 29 of 40 |
+    | 12 | 158 nm | 40 of 40 |
+    | 20 | 95 nm | 40 of 40 |
+    | 32 | 59 nm | 40 of 40 |
+
+    12 recovers everything but sits exactly on the observed boundary — 8 fails,
+    and every one of its failures is a film thinner than its first start. 20 puts
+    the spacing inside the narrowest basin with margin, at 20 fits per site. That
+    is about a second, which is also what §1 quotes for production inversion; the
+    honest cost of a correct classical answer was never one fit.
+
+    This default was originally 12, justified by an argument that the minima sit
+    one fringe apart (265 nm) so 165 nm spacing could not miss one. That argument
+    is false — the minima are 4 nm apart (``Implementation-Notes.md`` §18 and §19)
+    — and the number it produced happened to work. It has been re-derived from the
+    basin measurement above, which is the quantity that actually governs coverage.
 
     Endpoints are pulled inward — a start on a bound sits where the projection
     clamps, and the fit can stall there instead of descending.
@@ -488,7 +516,7 @@ def fit_multi_start(
     wavelengths_nm: NDArray,
     *,
     starts: NDArray | list[float] | None = None,
-    count: int = 12,
+    count: int = 20,
     spacing: str = "uniform",
     measurement: gen.Measurement | None = None,
     prior: gen.Prior | None = None,
@@ -517,10 +545,18 @@ def fit_multi_start(
     milliseconds, and this multiplies that by ``count``. The wall clock recorded
     here is the honest number for what a correct classical answer costs.
 
+    The bet on the deepest basin holds up under realistic noise, which is worth
+    stating because it was assumed rather than checked for a while. At an
+    ellipsometer sigma of 1e-3 rad the recovered thickness is still good to about
+    0.005 nm, and it takes roughly 30x that noise before the wrong basin is ever
+    chosen.
+
     Dispersion starts are fixed at the prior's midpoint while thickness is swept.
-    Thickness is what is ambiguous — §5.2(b) is periodicity in ``n·d`` — and
-    sweeping three parameters would raise the cost by the cube for a landscape
-    that is one-dimensional in the interesting direction.
+    Thickness is what is ambiguous, and measurably so: freezing the dispersion at
+    the truth leaves 17-33 local minima and does not move the hit rate at all
+    (``Implementation-Notes.md`` §18). Sweeping three parameters would raise the
+    cost by the cube for a landscape that is one-dimensional in the direction that
+    matters.
     """
     prior = prior or gen.Prior()
     fitters = {"least_squares": fit_least_squares, "autograd": fit_autograd}

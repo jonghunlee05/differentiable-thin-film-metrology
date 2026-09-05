@@ -42,7 +42,7 @@ def _cost_profile(observed, measurement, substrate, thicknesses) -> np.ndarray:
 
     A slice, not the full surface. The fit varies all three parameters, so the
     basins it finds are slightly wider than this slice suggests — but the slice
-    is what shows the periodicity, and periodicity in thickness is the claim.
+    is what shows the structure in thickness, which is the claim being made.
     """
     profile = np.empty(thicknesses.size)
     with torch.no_grad():
@@ -177,7 +177,7 @@ def main() -> int:
     figure.suptitle(
         f"Multimodal inversion for a {TRUE_THICKNESS:.0f} nm film: "
         f"{coarse.size} local minima, one true one {runner_up / max(winner, 1e-300):.0e}x deeper"
-        " — spec §5.2(b), §6",
+        " — spec §6",
         fontsize=10,
     )
 
