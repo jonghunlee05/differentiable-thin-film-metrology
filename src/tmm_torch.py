@@ -444,6 +444,17 @@ def spectra(
     Returns
     -------
     Reflectance of shape ``(B, W)``.
+
+    Notes
+    -----
+    Arithmetic here is complex128, but precision lost in the *inputs* cannot be
+    recovered: ``torch.tensor([...])`` defaults to float32, which rounds a
+    thickness at the 1e-6 nm level. That is femtometres against nanometre films
+    and is irrelevant to any spectrum, but it does set the floor on how exactly
+    an analytic null can be reproduced — a quarter-wave coating bottoms out
+    around 1e-15 from float32 inputs versus 1e-32 from float64. Pass
+    ``dtype=torch.float64`` where a limit is being checked rather than a
+    spectrum computed.
     """
     if thicknesses.ndim == 1:
         thicknesses = thicknesses.unsqueeze(0)
