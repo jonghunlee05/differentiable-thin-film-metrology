@@ -500,8 +500,8 @@ def fit_multi_start(
 
     DTFM-030 and DTFM-031 both established that a single cold-started fit reports
     ``success`` while being hundreds of nanometres wrong, and that exact gradients
-    do not help because §5.2(b)'s ambiguity lives in the cost surface rather than
-    in the Jacobian. Only a different *search* can address it, and this is that
+    do not help because the multimodality lives in the cost surface rather than in
+    the Jacobian. Only a different *search* can address it, and this is that
     search — the cheapest one that works, and the one §6 names.
 
     The winner is chosen by cost, which is the only criterion available when the

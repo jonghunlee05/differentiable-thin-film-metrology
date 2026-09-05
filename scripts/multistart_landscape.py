@@ -1,4 +1,4 @@
-"""The fringe-order ambiguity, drawn — DTFM-032.
+"""The multimodal cost surface, drawn — DTFM-032.
 
 Spec §6: "Handle multimodality with multi-start from many initial guesses;
 record where each converges. That landscape *is* the fringe-order ambiguity made
@@ -175,7 +175,7 @@ def main() -> int:
     ripple.legend(fontsize=8, loc="lower right")
 
     figure.suptitle(
-        f"Fringe-order ambiguity for a {TRUE_THICKNESS:.0f} nm film: "
+        f"Multimodal inversion for a {TRUE_THICKNESS:.0f} nm film: "
         f"{coarse.size} local minima, one true one {runner_up / max(winner, 1e-300):.0e}x deeper"
         " — spec §5.2(b), §6",
         fontsize=10,

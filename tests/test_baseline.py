@@ -728,3 +728,57 @@ def test_bad_arguments_are_refused():
         bl.multi_start_grid(4, spacing="geometric")
     with pytest.raises(ValueError, match="method"):
         bl.fit_multi_start(np.zeros(400), WAVELENGTHS, count=2, method="newton")
+
+
+def test_broadband_data_replaces_few_deep_minima_with_many_shallow_ones(substrate):
+    """What the cold-start failures of DTFM-030 to 032 actually are.
+
+    All three tickets called them §5.2(b) fringe-order ambiguity. That is the
+    *single-wavelength* picture: R is periodic in ``n·d``, so aliases sit one
+    fringe apart, ``λ / (2 n cos θ_t) ≈ 265 nm`` here. Measured against the real
+    cost surface, it does not hold — the minima are 4 nm apart, not 265, and the
+    fit's landing point at 316.96 nm is 53 nm from the nearest predicted alias.
+
+    The cause is broadband. Each wavelength has its own fringe period (177 nm at
+    400 nm, 353 nm at 800 nm), and summing 200 of them produces a beat landscape
+    far denser than any one of them. Narrow the band or thin the sampling and the
+    textbook picture returns:
+
+    | band | points | minima | median spacing |
+    |---|---|---|---|
+    | 599-601 nm | 3 | 15 | 132 nm |
+    | 550-650 nm | 50 | 53 | 6.4 nm |
+    | 400-800 nm | 200 | 279 | 4.2 nm |
+
+    This is not a defect. It is the bargain broadband makes, and it cuts both
+    ways: the false minima get *shallow* as they get dense, which is why the true
+    minimum ends up ~1e26 deeper and why multi-start works on depth. §5.2(b)'s
+    ambiguity has not been removed by using a spectrum — it has been traded for a
+    rougher surface with an unmistakable global answer.
+    """
+    grid = np.linspace(20.0, 2000.0, 4000)
+    truth = np.array([900.0, 1.46, 0.004])
+
+    def minima_of(measurement) -> np.ndarray:
+        observed = _observe(truth, measurement, substrate)
+        cost = np.empty(grid.size)
+        with torch.no_grad():
+            for i, thickness in enumerate(grid):
+                model = bl.forward_observable(
+                    [thickness, truth[1], truth[2]], WAVELENGTHS, measurement, substrate
+                ).numpy()
+                residual = bl.wrapped_residual(model, observed, measurement.observable)
+                cost[i] = 0.5 * np.sum(residual**2)
+        interior = (cost[1:-1] < cost[:-2]) & (cost[1:-1] < cost[2:])
+        return grid[1:-1][interior]
+
+    single_fringe_nm = 265.0
+    broadband = minima_of(gen.Measurement())
+    reflectance = minima_of(gen.Measurement(observable="reflectance"))
+
+    assert np.median(np.diff(broadband)) < 0.2 * single_fringe_nm, (
+        "the minima are far denser than one per fringe"
+    )
+    assert broadband.size > 5 * reflectance.size, (
+        "and the phase observable is much rougher than the intensity one"
+    )
