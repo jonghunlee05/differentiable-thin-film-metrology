@@ -5,6 +5,8 @@ Torch/numpy parity at a single interface by DTFM-008; quarter-wave null and
 agreement with the reference `tmm` package by DTFM-015 and DTFM-016.
 """
 
+import cmath
+
 import numpy as np
 import pytest
 import torch
@@ -690,3 +692,139 @@ def test_batch_shape_errors_are_rejected():
 
     with pytest.raises(ValueError, match=r"thicknesses must be"):
         pt.spectra(SPECTRUM, torch.zeros(2, 2, 2), [1.0, 1.46, 3.88])
+
+
+# --- validation 1: the single-interface limit, DTFM-014 ---------------------
+#
+# Spec §12 Weeks 1–2, the first of the three required validations.
+#
+# The no-layer check in DTFM-012 compares the stack against this project's own
+# `reflectance`, which shares every primitive with it — a consistency check, not
+# a validation. What follows instead compares against the §4.2 closed form
+# written out independently below, using only the standard library. If a
+# convention were wrong in a way that is self-consistent across `src`, that is
+# the error class these tests exist to catch and the earlier one cannot.
+
+
+def analytic_fresnel_R(n_i: complex, n_j: complex, theta_i: float, pol: str) -> float:
+    """Reflectance at one interface, from §4.2, in plain python.
+
+    Deliberately duplicates `src` rather than importing it. No numpy, no torch,
+    no project code — the point is an independent second opinion.
+    """
+    sin_t = (n_i / n_j) * cmath.sin(theta_i)
+    cos_t = cmath.sqrt(1.0 - sin_t * sin_t)
+    if (n_j * cos_t).imag < 0.0:  # §4.2 branch condition
+        cos_t = -cos_t
+    cos_i = cmath.cos(theta_i)
+
+    if pol == "s":
+        r = (n_i * cos_i - n_j * cos_t) / (n_i * cos_i + n_j * cos_t)
+    else:
+        r = (n_j * cos_i - n_i * cos_t) / (n_j * cos_i + n_i * cos_t)
+    return abs(r) ** 2
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_no_layer_stack_matches_the_analytic_closed_form(n_i, n_j, pol):
+    """The acceptance criterion, against an independent implementation."""
+    angles = np.linspace(0.0, np.pi / 2 - 1e-6, 37)
+    got = pt.stack_reflectance(WAVELENGTH, [], [n_i, n_j], torch.tensor(angles), pol)
+    expected = [analytic_fresnel_R(n_i, n_j, float(a), pol) for a in angles]
+
+    assert np.allclose(got.numpy(), expected, rtol=0, atol=1e-13)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("n_j", ABSORBING)
+def test_no_layer_stack_matches_the_closed_form_for_absorbing_media(n_j, pol):
+    """The same, with complex indices — the DTFM-010 branch choice included."""
+    angles = np.linspace(0.0, np.pi / 2 - 1e-6, 37)
+    got = pt.stack_reflectance(WAVELENGTH, [], [1.0, n_j], torch.tensor(angles), pol)
+    expected = [analytic_fresnel_R(1.0, n_j, float(a), pol) for a in angles]
+
+    assert np.allclose(got.numpy(), expected, rtol=0, atol=1e-13)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_no_layer_stack_is_wavelength_independent(n_i, n_j, pol):
+    """The AC asks for "across angle and wavelength".
+
+    With no layer there is no thickness, so nothing in the problem carries a
+    length scale and R cannot depend on λ. A wavelength dependence here would
+    mean a stray λ has leaked into the interface matrices, where it does not
+    belong — an error the single-wavelength test could not see.
+    """
+    for angle in (0.0, 0.4, 1.2):
+        R = pt.stack_reflectance(SPECTRUM, [], [n_i, n_j], angle, pol)
+        assert torch.allclose(R, R[0].expand_as(R), atol=1e-15)
+        assert R[0].item() == pytest.approx(analytic_fresnel_R(n_i, n_j, angle, pol), abs=1e-13)
+
+
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_normal_incidence_reduces_to_the_textbook_expression(n_i, n_j):
+    """R = ((n_i − n_j)/(n_i + n_j))² — checkable by hand, no code involved."""
+    expected = ((n_i - n_j) / (n_i + n_j)) ** 2
+    for pol in POLARISATIONS:
+        R = pt.stack_reflectance(SPECTRUM, [], [n_i, n_j], 0.0, pol)
+        assert torch.allclose(R, torch.full_like(R, expected), atol=1e-14)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_a_film_matching_the_substrate_is_invisible(n_i, n_j, pol):
+    """A stronger reduction than removing the layer: the layer is *present*.
+
+    With the film index equal to the substrate index the buried interface has
+    r = 0 and t = 1, so I_12 is the identity and the algebra collapses to
+    r_total = r_01 exactly, for any thickness. Unlike the empty-stack test this
+    exercises the layer matrix and the second interface matrix and demands they
+    cancel — so a phase-convention error that the empty stack skips over would
+    surface here.
+    """
+    expected = analytic_fresnel_R(n_i, n_j, 0.35, pol)
+    for d in (0.0, 137.0, 900.0):
+        R = pt.stack_reflectance(SPECTRUM, [d], [n_i, n_j, n_j], 0.35, pol)
+        assert torch.allclose(R, torch.full_like(R, expected), atol=1e-12)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_a_film_matching_the_ambient_only_adds_phase(n_i, n_j, pol):
+    """The mirror case: the film is indistinguishable from the medium above it.
+
+    Now the *first* interface vanishes and the algebra gives r_total = r·e^{2iδ}
+    — the same magnitude with an extra propagation phase, which is physically
+    right, since the light has simply travelled further before reflecting.
+    Reflectance is therefore unchanged while the amplitude is not, and asserting
+    the pair pins the phase bookkeeping rather than only its modulus.
+    """
+    expected = analytic_fresnel_R(n_i, n_j, 0.35, pol)
+    for d in (137.0, 900.0):
+        R = pt.stack_reflectance(SPECTRUM, [d], [n_i, n_i, n_j], 0.35, pol)
+        assert torch.allclose(R, torch.full_like(R, expected), atol=1e-12)
+
+    r_direct = pt.stack_r(WAVELENGTH, [], [n_i, n_j], 0.35, pol)
+    r_delayed = pt.stack_r(WAVELENGTH, [137.0], [n_i, n_i, n_j], 0.35, pol)
+    assert r_delayed.abs().item() == pytest.approx(r_direct.abs().item(), abs=1e-12)
+    assert not torch.allclose(r_delayed, r_direct, atol=1e-6), "the extra phase is missing"
+
+
+def test_output_shape_does_not_depend_on_layer_count():
+    """Wavelength enters only through the layer phase, so a zero-layer stack
+    used to drop the spectrum axis and return a scalar.
+
+    Found while writing the validation above. The physics was unaffected — with
+    no thickness R genuinely cannot depend on λ — but a caller indexing the
+    spectrum axis would have got a 0-dim tensor instead of an error, and the
+    shape would have varied with the layer count.
+    """
+    for thicknesses in ([], [120.0], [120.0, 65.0]):
+        indices = [1.0] + [1.46, 2.3][: len(thicknesses)] + [3.88]
+        R = pt.stack_reflectance(SPECTRUM, thicknesses, indices, 0.3, "s")
+        assert R.shape == SPECTRUM.shape
+
+    empty = pt.spectra(SPECTRUM, torch.zeros(4, 0), [1.0, 3.88])
+    assert empty.shape == (4, SPECTRUM.numel())

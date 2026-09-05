@@ -371,7 +371,16 @@ def stack_matrix(
         layer = layer_matrix(n[j], thicknesses[j - 1], wavelength, cos[j])
         boundary = interface_matrix_from_cosines(n[j], n[j + 1], cos[j], cos[j + 1], polarisation)
         matrix = matrix @ layer @ boundary
-    return matrix
+
+    # Wavelength enters only through the layer phase, so a stack with no layers
+    # would otherwise return a result that has silently dropped the wavelength
+    # axis. The physics is right either way — with no thickness there is no
+    # length scale and R cannot depend on λ — but the shape would depend on the
+    # layer count, and a caller indexing the spectrum axis would get a scalar
+    # rather than an error. Broadcast so the output shape is always the same.
+    lam = as_complex(wavelength)
+    shape = torch.broadcast_shapes(matrix.shape[:-2], lam.shape)
+    return matrix.expand(*shape, 2, 2)
 
 
 def stack_r(
@@ -460,7 +469,12 @@ def spectra(
         n if isinstance(n, torch.Tensor) and n.ndim == 2 else _as_row(n) for n in indices
     ]
 
-    return stack_reflectance(lam, per_layer, broadcast_indices, theta_0, polarisation)
+    R = stack_reflectance(lam, per_layer, broadcast_indices, theta_0, polarisation)
+
+    # The batch axis enters only through the thicknesses, so a stack with no
+    # layers would return shape (1, W) rather than (B, W) — the rows are all
+    # identical, but the contract above promises (B, W) regardless of depth.
+    return R.expand(thicknesses.shape[0], wavelengths.numel())
 
 
 def _as_row(n: torch.Tensor | float) -> torch.Tensor | float:
