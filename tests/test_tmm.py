@@ -828,3 +828,128 @@ def test_output_shape_does_not_depend_on_layer_count():
 
     empty = pt.spectra(SPECTRUM, torch.zeros(4, 0), [1.0, 3.88])
     assert empty.shape == (4, SPECTRUM.numel())
+
+
+# --- validation 2: the quarter-wave AR null, DTFM-015 -----------------------
+#
+# Spec §12 Weeks 1–2, the second required validation, and the sharpest of the
+# three. The first validation compared the stack against a formula transcribed
+# from §4.2; this one asks the stack to *predict* something. A single layer of
+# index sqrt(n_sub) and quarter-wave optical thickness must cancel its own
+# reflection exactly — a result nowhere written in the code, which has to emerge
+# from the interface and layer matrices being individually right and correctly
+# ordered. A convention error surviving the previous validations would show here.
+
+DESIGN_WAVELENGTH = 550.0
+SUBSTRATES = [1.52, 2.30, 3.88]
+
+
+def quarter_wave_coating(n_sub: float, n_ambient: float = 1.0) -> tuple[float, float]:
+    """Ideal single-layer AR coating: index sqrt(n_0·n_sub), thickness λ/(4n)."""
+    n_film = float(np.sqrt(n_ambient * n_sub))
+    return n_film, DESIGN_WAVELENGTH / (4.0 * n_film)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("n_sub", SUBSTRATES)
+def test_quarter_wave_coating_nulls_reflectance_at_its_design_wavelength(n_sub, pol):
+    """The acceptance criterion. A null, so unreachable by a scale error."""
+    n_film, d = quarter_wave_coating(n_sub)
+    R = pt.stack_reflectance(torch.tensor(DESIGN_WAVELENGTH), [d], [1.0, n_film, n_sub], 0.0, pol)
+
+    assert R.item() == pytest.approx(0.0, abs=1e-20)
+
+
+@pytest.mark.parametrize("n_sub", SUBSTRATES)
+def test_the_coating_is_removing_a_reflection_that_was_actually_there(n_sub):
+    """Guards the null against passing for a trivial reason.
+
+    A forward model that returned zero everywhere would satisfy the test above.
+    The uncoated substrate must reflect substantially — 4% for glass, 35% for
+    silicon — before cancelling it to zero means anything.
+    """
+    bare = pt.stack_reflectance(torch.tensor(DESIGN_WAVELENGTH), [], [1.0, n_sub], 0.0, "s")
+    assert bare.item() > 0.04
+
+
+@pytest.mark.parametrize("n_sub", SUBSTRATES)
+def test_the_null_sits_at_the_design_wavelength_and_nowhere_else(n_sub):
+    """Locating the minimum numerically is stronger than evaluating at one point:
+    a coating that nulled at some other wavelength would pass a point check.
+    """
+    n_film, d = quarter_wave_coating(n_sub)
+    wavelengths = torch.linspace(300.0, 900.0, 6001)
+    R = pt.stack_reflectance(wavelengths, [d], [1.0, n_film, n_sub], 0.0, "s")
+
+    assert wavelengths[R.argmin()].item() == pytest.approx(DESIGN_WAVELENGTH, abs=0.2)
+    # and the null is genuinely localised, not a flat floor
+    assert R[0].item() > 1e-3
+    assert R[-1].item() > 1e-3
+
+
+@pytest.mark.parametrize("n_sub", SUBSTRATES)
+def test_the_wrong_film_index_spoils_the_null(n_sub):
+    """The condition is n_film = sqrt(n_sub) specifically, not any thin layer.
+
+    Without this, a bug that cancelled reflection for *any* quarter-wave layer
+    would pass every test above while being physically wrong.
+    """
+    _, d_ideal = quarter_wave_coating(n_sub)
+    n_ideal = float(np.sqrt(n_sub))
+
+    for factor in (0.8, 1.25):
+        n_wrong = n_ideal * factor
+        d_wrong = DESIGN_WAVELENGTH / (4.0 * n_wrong)
+        R = pt.stack_reflectance(
+            torch.tensor(DESIGN_WAVELENGTH), [d_wrong], [1.0, n_wrong, n_sub], 0.0, "s"
+        )
+        assert R.item() > 1e-4, "reflection cancelled by a coating that should not cancel it"
+
+    assert d_ideal > 0.0
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("n_sub", SUBSTRATES)
+@pytest.mark.parametrize("n_film", [1.35, 1.97, 2.60, 3.10])
+def test_a_half_wave_layer_is_absentee(n_sub, n_film, pol):
+    """A second sharp prediction, independent of the AR condition.
+
+    A layer of half-wave optical thickness accumulates δ = π, so its matrix is
+    −I and it drops out of the product entirely: the stack must reflect exactly
+    as the bare substrate does, whatever the layer is made of. This is a strong
+    test of the phase convention specifically — it is the δ = π point, so a
+    factor of two anywhere in the phase would move it.
+    """
+    d = DESIGN_WAVELENGTH / (2.0 * n_film)
+    lam = torch.tensor(DESIGN_WAVELENGTH)
+
+    coated = pt.stack_reflectance(lam, [d], [1.0, n_film, n_sub], 0.0, pol)
+    bare = pt.stack_reflectance(lam, [], [1.0, n_sub], 0.0, pol)
+
+    assert coated.item() == pytest.approx(bare.item(), abs=1e-12)
+
+
+@pytest.mark.parametrize("n_sub", SUBSTRATES)
+def test_the_null_degrades_away_from_normal_incidence(n_sub):
+    """The design is a normal-incidence one, and must behave like it.
+
+    Reflectance should rise monotonically with angle — the coating is still
+    helping, but no longer perfectly. §3 keeps this project at normal or
+    near-normal incidence for exactly this reason.
+    """
+    n_film, d = quarter_wave_coating(n_sub)
+    angles = [0.0, 0.2, 0.4, 0.6, 0.9]
+    values = [
+        pt.stack_reflectance(
+            torch.tensor(DESIGN_WAVELENGTH), [d], [1.0, n_film, n_sub], a, "s"
+        ).item()
+        for a in angles
+    ]
+
+    assert all(b > a for a, b in zip(values, values[1:], strict=False))
+    assert values[0] < 1e-20
+    # still far better than no coating at all, even well off-axis
+    bare = pt.stack_reflectance(
+        torch.tensor(DESIGN_WAVELENGTH), [], [1.0, n_sub], 0.9, "s"
+    ).item()
+    assert values[-1] < bare
