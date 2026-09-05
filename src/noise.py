@@ -25,8 +25,11 @@ from collections.abc import Sequence
 import numpy as np
 
 __all__ = [
+    "add_backside_reflection",
     "add_interfacial_layer",
     "add_surface_roughness",
+    "apply_spectrometer_bandwidth",
+    "average_over_thickness",
     "bruggeman_epsilon",
     "effective_medium_index",
 ]
@@ -152,3 +155,131 @@ def add_interfacial_layer(
     layer_index = effective_medium_index(film, substrate, mix_fraction) if index is None else index
 
     return [*thicknesses, thickness_nm], [*indices[:-1], layer_index, indices[-1]]
+
+
+# --- effects on the measured spectrum, DTFM-024 -----------------------------
+#
+# Unlike roughness and the interfacial layer, these three do not change the
+# stack. They act on the spectrum the stack produces, so they are applied after
+# the forward model rather than before it.
+
+
+def average_over_thickness(
+    forward,
+    thickness_nm: float,
+    sigma_nm: float,
+    *,
+    samples: int = 21,
+):
+    """Average reflectance over a spread of thicknesses within the spot (§4.5).
+
+    A measurement spot is tens of microns across and the film is not perfectly
+    uniform beneath it, so the detector sees a *sum of spectra* from slightly
+    different thicknesses rather than one spectrum. Averaging ``R`` over
+    ``d ~ N(d₀, s²)`` is the standard treatment.
+
+    Averaging intensities, not amplitudes: light from different parts of the
+    spot is mutually incoherent, so the powers add. Averaging the complex
+    amplitude instead would model a single film of the mean thickness and miss
+    the effect entirely.
+
+    The signature is **damped high-order fringes**: fringes are periodic in
+    ``d``, so a spread in ``d`` blurs them, and blurs the closely-spaced ones
+    hardest. §4.5 notes finite spectrometer bandwidth produces the same
+    signature — see :func:`apply_spectrometer_bandwidth` and the discussion in
+    :mod:`tests.test_noise`.
+
+    Parameters
+    ----------
+    forward : callable taking a thickness and returning a spectrum.
+    thickness_nm : the mean thickness ``d₀``.
+    sigma_nm : the standard deviation ``s``. Zero returns ``forward(d₀)``
+        unchanged, so the effect is switchable.
+    samples : quadrature points across the distribution. Odd, so the mean is
+        always evaluated.
+    """
+    if sigma_nm < 0.0:
+        raise ValueError(f"sigma must be non-negative, got {sigma_nm}")
+    if samples < 3 or samples % 2 == 0:
+        raise ValueError(f"samples must be odd and at least 3, got {samples}")
+    if sigma_nm == 0.0:
+        return forward(thickness_nm)
+
+    # Gauss-Hermite would need fewer points, but a plain truncated grid keeps
+    # the weights inspectable and the ±4σ tail contributes below 1e-4.
+    offsets = np.linspace(-4.0, 4.0, samples)
+    weights = np.exp(-0.5 * offsets**2)
+    weights = weights / weights.sum()
+
+    total = None
+    for offset, weight in zip(offsets, weights, strict=True):
+        contribution = forward(thickness_nm + offset * sigma_nm) * weight
+        total = contribution if total is None else total + contribution
+    return total
+
+
+def apply_spectrometer_bandwidth(wavelengths_nm, reflectance, fwhm_nm: float):
+    """Convolve the spectrum with the instrument's slit function (§4.5).
+
+    No spectrometer resolves a single wavelength: each detector element collects
+    a band, so the recorded value at ``λ`` is an average of nearby ones. Modelled
+    as a Gaussian of the stated full width at half maximum.
+
+    Like spot non-uniformity this **damps high-order fringes** — closely spaced
+    fringes are averaged away while widely spaced ones survive. That the two
+    effects share a signature is §4.5's point, and it is a degeneracy in the
+    *noise model* sitting on top of the degeneracy in the physics.
+
+    Uses explicit normalised weights per output point rather than an FFT, so the
+    result is correct at the ends of the band instead of wrapping around them —
+    and a spectrum's edges are exactly where a fit is most sensitive.
+    """
+    if fwhm_nm < 0.0:
+        raise ValueError(f"FWHM must be non-negative, got {fwhm_nm}")
+
+    wavelengths_nm = np.asarray(wavelengths_nm, dtype=float)
+    values = np.asarray(reflectance, dtype=float)
+    if fwhm_nm == 0.0:
+        return values
+
+    sigma = fwhm_nm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    separation = wavelengths_nm[:, None] - wavelengths_nm[None, :]
+    kernel = np.exp(-0.5 * (separation / sigma) ** 2)
+    kernel = kernel / kernel.sum(axis=1, keepdims=True)
+    return kernel @ values
+
+
+def add_backside_reflection(
+    reflectance,
+    substrate_index,
+    *,
+    transmittance=None,
+):
+    """Add the incoherent reflection from the wafer's rear face (§4.5).
+
+    A wafer is polished on both sides and is hundreds of microns thick — far more
+    than the coherence length of a broadband source — so light reaching the back
+    surface reflects and returns *without* a fixed phase relationship to the
+    front reflection. It adds in intensity rather than amplitude, which is why it
+    appears as a near-constant **offset** rather than as extra fringes.
+
+    Approximated as one bounce off the substrate/air boundary, attenuated by the
+    round trip through the front surface. The substrate must be transparent
+    enough for light to reach the back at all; silicon in the visible absorbs it
+    entirely, which is itself the reason the effect is usually seen in the
+    infrared or on glass rather than on a silicon wafer in the visible.
+
+    Set ``transmittance = 0`` to switch the effect off.
+    """
+    values = np.asarray(reflectance, dtype=float)
+    index = np.asarray(substrate_index)
+
+    back_face = np.abs((index - 1.0) / (index + 1.0)) ** 2
+    if transmittance is None:
+        transmittance = 1.0 - values
+    transmittance = np.asarray(transmittance, dtype=float)
+
+    if np.any(transmittance < 0.0) or np.any(transmittance > 1.0):
+        raise ValueError("transmittance must lie in [0, 1]")
+
+    return values + transmittance**2 * back_face

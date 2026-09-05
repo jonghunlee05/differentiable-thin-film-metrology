@@ -255,3 +255,208 @@ def test_the_modified_stack_still_differentiates():
     _spectrum(thicknesses, indices).sum().backward()
 
     assert torch.isfinite(thickness.grad) and thickness.grad.item() != 0.0
+
+
+# --- effects on the measured spectrum, DTFM-024 -----------------------------
+#
+# Spec §4.5. These three act on the spectrum rather than the stack, so they are
+# applied after the forward model.
+
+BLUR_WAVELENGTHS = np.linspace(450.0, 800.0, 400)
+THICK_FILM = 900.0  # closely spaced fringes, where blurring actually bites
+
+
+def _clean(thickness_nm: float) -> np.ndarray:
+    return pt.stack_reflectance(
+        torch.tensor(BLUR_WAVELENGTHS), [float(thickness_nm)], [1.0, FILM, SUBSTRATE], 0.0, "s"
+    ).numpy()
+
+
+def _amplitude(spectrum) -> float:
+    return float(np.max(spectrum) - np.min(spectrum))
+
+
+# --- spot non-uniformity ----------------------------------------------------
+
+
+def test_thickness_averaging_is_switchable():
+    exact = _clean(THICK_FILM)
+    averaged = noise.average_over_thickness(_clean, THICK_FILM, 0.0)
+
+    assert np.array_equal(exact, averaged)
+
+
+def test_thickness_spread_damps_fringes_monotonically():
+    """§4.5's signature. Fringes are periodic in d, so a spread in d blurs them."""
+    amplitudes = [
+        _amplitude(noise.average_over_thickness(_clean, THICK_FILM, sigma, samples=41))
+        for sigma in (0.0, 5.0, 10.0, 20.0, 40.0)
+    ]
+
+    assert all(b < a for a, b in zip(amplitudes, amplitudes[1:], strict=False))
+    assert amplitudes[-1] < 0.7 * amplitudes[0]
+
+
+def test_intensities_are_averaged_not_amplitudes():
+    """Light from different parts of the spot is mutually incoherent.
+
+    Averaging the complex amplitude instead would describe a single film of the
+    mean thickness and produce no damping at all — the effect would vanish while
+    the code still looked like it was doing something.
+    """
+    averaged = noise.average_over_thickness(_clean, THICK_FILM, 30.0, samples=41)
+    single_film_at_mean = _clean(THICK_FILM)
+
+    assert _amplitude(averaged) < 0.8 * _amplitude(single_film_at_mean)
+
+
+def test_averaging_keeps_the_spectrum_physical():
+    averaged = noise.average_over_thickness(_clean, THICK_FILM, 30.0, samples=41)
+
+    assert np.all((averaged >= 0.0) & (averaged <= 1.0))
+
+
+def test_averaging_rejects_bad_arguments():
+    with pytest.raises(ValueError, match="non-negative"):
+        noise.average_over_thickness(_clean, THICK_FILM, -1.0)
+    with pytest.raises(ValueError, match="odd"):
+        noise.average_over_thickness(_clean, THICK_FILM, 5.0, samples=20)
+
+
+# --- finite spectrometer bandwidth ------------------------------------------
+
+
+def test_bandwidth_is_switchable():
+    spectrum = _clean(THICK_FILM)
+    assert np.array_equal(
+        spectrum, noise.apply_spectrometer_bandwidth(BLUR_WAVELENGTHS, spectrum, 0.0)
+    )
+
+
+def test_bandwidth_damps_fringes_monotonically():
+    spectrum = _clean(THICK_FILM)
+    amplitudes = [
+        _amplitude(noise.apply_spectrometer_bandwidth(BLUR_WAVELENGTHS, spectrum, fwhm))
+        for fwhm in (0.0, 4.0, 8.0, 16.0, 32.0)
+    ]
+
+    assert all(b < a for a, b in zip(amplitudes, amplitudes[1:], strict=False))
+
+
+def test_bandwidth_conserves_the_mean_level():
+    """Blurring redistributes but does not create or destroy — a normalised
+    kernel must leave the average essentially untouched.
+    """
+    spectrum = _clean(THICK_FILM)
+    blurred = noise.apply_spectrometer_bandwidth(BLUR_WAVELENGTHS, spectrum, 10.0)
+
+    assert blurred.mean() == pytest.approx(spectrum.mean(), abs=2e-3)
+
+
+def test_bandwidth_does_not_wrap_around_the_band_edges():
+    """Explicit per-point weights rather than an FFT, deliberately.
+
+    A circular convolution would fold the red end of the spectrum onto the blue
+    one. The ends of a band are exactly where a fit is most sensitive, so an
+    artefact there is expensive. A monotonic ramp must stay monotonic.
+    """
+    ramp = np.linspace(0.1, 0.9, BLUR_WAVELENGTHS.size)
+    blurred = noise.apply_spectrometer_bandwidth(BLUR_WAVELENGTHS, ramp, 20.0)
+
+    assert np.all(np.diff(blurred) > 0.0)
+    assert blurred[0] == pytest.approx(ramp[0], abs=0.05)
+    assert blurred[-1] == pytest.approx(ramp[-1], abs=0.05)
+
+
+# --- the shared signature, which is the point of the ticket -----------------
+
+
+def test_bandwidth_and_spot_non_uniformity_are_hard_to_tell_apart():
+    """§4.5: "Same signature as above — and that ambiguity is itself interesting."
+
+    Quantified: a single instrument bandwidth can reproduce the spectrum of a
+    20 nm thickness spread to within 2.3e-02, where the difference between
+    either and the undamped spectrum is 4.2e-02. So the two effects resemble
+    each other roughly twice as well as either resembles the truth.
+
+    They are not identical, and the reason is worth stating: a thickness spread
+    blurs in d, which maps to a wavelength blur that grows as λ²/2nd, while an
+    instrument bandwidth is constant in wavelength. That difference is the only
+    handle a fit has for separating them.
+    """
+    clean = _clean(THICK_FILM)
+    spread = noise.average_over_thickness(_clean, THICK_FILM, 20.0, samples=61)
+
+    best = min(
+        (np.abs(noise.apply_spectrometer_bandwidth(BLUR_WAVELENGTHS, clean, f) - spread).max(), f)
+        for f in np.linspace(1.0, 40.0, 40)
+    )
+    mismatch, _ = best
+    difference_from_clean = np.abs(clean - spread).max()
+
+    assert mismatch < difference_from_clean
+    assert mismatch > 0.0, "the two effects are not exactly degenerate"
+
+
+def test_separating_them_needs_spectral_range():
+    """The actionable form of that ambiguity.
+
+    Over a narrow band the two are indistinguishable; the handle above only
+    appears once the band is wide enough for λ² to vary appreciably. Measured
+    here as the ratio of how well the two effects match each other to how well
+    either matches the clean spectrum — 1.0 means indistinguishable.
+
+    This bears directly on §10's failure atlas: whether a defect is separable is
+    a property of the measurement design, not only of the estimator.
+    """
+    def separability(low: float, high: float) -> float:
+        wavelengths = np.linspace(low, high, 300)
+        tensor = torch.tensor(wavelengths)
+
+        def forward(thickness):
+            return pt.stack_reflectance(
+                tensor, [float(thickness)], [1.0, FILM, SUBSTRATE], 0.0, "s"
+            ).numpy()
+
+        clean = forward(THICK_FILM)
+        spread = noise.average_over_thickness(forward, THICK_FILM, 20.0, samples=41)
+        mismatch = min(
+            np.abs(noise.apply_spectrometer_bandwidth(wavelengths, clean, f) - spread).max()
+            for f in np.linspace(1.0, 40.0, 40)
+        )
+        return float(np.abs(clean - spread).max() / mismatch)
+
+    narrow = separability(575.0, 625.0)
+    wide = separability(400.0, 1000.0)
+
+    assert narrow < 1.6, "a narrow band should barely separate them"
+    assert wide > 1.5 * narrow, "a wider band should separate them better"
+
+
+# --- backside reflection ----------------------------------------------------
+
+
+def test_backside_reflection_is_switchable():
+    spectrum = _clean(THICK_FILM)
+    assert np.array_equal(
+        spectrum, noise.add_backside_reflection(spectrum, SUBSTRATE, transmittance=0.0)
+    )
+
+
+def test_backside_reflection_adds_an_offset_rather_than_fringes():
+    """§4.5's signature. The wafer is far thicker than the coherence length, so
+    the rear reflection adds in intensity and carries no phase — it raises the
+    curve without changing its shape.
+    """
+    spectrum = _clean(THICK_FILM)
+    with_back = noise.add_backside_reflection(spectrum, 1.52)
+
+    assert np.all(with_back >= spectrum)
+    assert with_back.mean() > spectrum.mean() + 1e-3
+    # the fringe structure is preserved, not reshaped
+    assert np.corrcoef(with_back, spectrum)[0, 1] > 0.98
+
+
+def test_backside_reflection_rejects_impossible_transmittance():
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        noise.add_backside_reflection(_clean(THICK_FILM), 1.52, transmittance=1.5)
