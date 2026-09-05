@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 
 __all__ = [
@@ -56,10 +57,14 @@ def as_complex(x: torch.Tensor | float | int) -> torch.Tensor:
     root under total internal reflection.
     """
     if not isinstance(x, torch.Tensor):
-        # A python complex must be built as complex directly: torch.tensor
-        # rejects it under a float dtype rather than coercing.
-        dtype = _CDTYPE if isinstance(x, complex) else torch.float64
-        x = torch.tensor(x, dtype=dtype)
+        # Complexity is decided from the data, not from the python type. A
+        # python complex and a numpy complex *scalar* both satisfy
+        # isinstance(x, complex); a numpy complex *array* does not, and building
+        # it under a float dtype silently discards the imaginary part — dropping
+        # absorption from a wavelength-dependent index with only a warning.
+        array = np.asarray(x)
+        dtype = _CDTYPE if np.iscomplexobj(array) else torch.float64
+        x = torch.as_tensor(array, dtype=dtype)
     if x.is_complex():
         return x.to(_CDTYPE)
     return torch.complex(x.to(torch.float64), torch.zeros_like(x, dtype=torch.float64))
