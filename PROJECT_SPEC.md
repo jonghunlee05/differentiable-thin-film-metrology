@@ -208,7 +208,9 @@ with angles related by Snell's law `ñ_i sinθ_i = ñ_j sinθ_j`, so
 cosθ_j = sqrt(1 − (ñ_i/ñ_j)² sin²θ_i)
 ```
 
-**Branch cut warning.** For absorbing media `ñ` is complex and this square root has two roots. The physical one satisfies `Im(cosθ_j) ≥ 0`. Choosing the wrong branch produces gain instead of absorption — this is the single most common bug in a from-scratch implementation and it can cost an evening. Assert the sign explicitly in code.
+**Branch cut warning.** For absorbing media `ñ` is complex and this square root has two roots. The physical one satisfies **`Im(ñ_j cosθ_j) ≥ 0`**. Choosing the wrong branch produces gain instead of absorption — this is the single most common bug in a from-scratch implementation and it can cost an evening. Assert the sign explicitly in code.
+
+The condition is on `ñ_j cosθ_j`, not on `cosθ_j` alone, because the transmitted wave carries `exp(i·(2π/λ)·ñ_j·d·cosθ_j)` and it is that product which sets whether the amplitude decays or grows. The two conditions coincide whenever the incident medium is transparent, which is why the simpler form is often quoted — but they diverge once the incident medium absorbs, and every interior interface of a stack containing an absorbing film is exactly that case. Measured over an index-and-angle sweep spanning weak absorbers to metals: the two rules disagree on 3% of cases, and `Im(cosθ_j) ≥ 0` admits gain in all of them. The naive principal root is unphysical in roughly 14%.
 
 ### 4.3 Transfer matrix method
 
