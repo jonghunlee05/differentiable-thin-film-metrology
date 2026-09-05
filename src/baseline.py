@@ -31,6 +31,9 @@ from src import tmm_torch as pt
 
 __all__ = [
     "FitResult",
+    "MultiStartResult",
+    "fit_multi_start",
+    "multi_start_grid",
     "fit_autograd",
     "fit_least_squares",
     "forward_observable",
@@ -344,4 +347,213 @@ def fit_autograd(
             else f"{optimiser}: stopped at the iteration limit ({max_iterations})"
         ),
         initial=start,
+    )
+
+
+@dataclass
+class MultiStartResult:
+    """Every convergence point from one multi-start sweep, not just the winner.
+
+    §6: "Handle multimodality with multi-start from many initial guesses; record
+    where each converges. That landscape *is* the fringe-order ambiguity made
+    visible."
+
+    So the losing fits are kept. They are the evidence that the ambiguity is
+    real, they are what the landscape figure is drawn from, and DTFM-033 needs
+    them to say whether an error bar computed at the winner means anything when
+    a competing minimum sits 600 nm away.
+    """
+
+    fits: list[FitResult]
+    starts: NDArray[np.float64]
+    best_index: int
+    truth: NDArray[np.float64] | None
+    wall_clock_s: float
+
+    @property
+    def best(self) -> FitResult:
+        """The lowest-cost fit — what a practitioner would actually report."""
+        return self.fits[self.best_index]
+
+    @property
+    def parameters(self) -> NDArray[np.float64]:
+        return self.best.parameters
+
+    @property
+    def thickness_error_nm(self) -> float | None:
+        return self.best.thickness_error_nm
+
+    @property
+    def costs(self) -> NDArray[np.float64]:
+        return np.array([fit.cost for fit in self.fits])
+
+    @property
+    def thicknesses(self) -> NDArray[np.float64]:
+        """Where each start converged to, in the order the starts were given."""
+        return np.array([fit.parameters[0] for fit in self.fits])
+
+    def basins(self, tolerance_nm: float = 1.0) -> tuple[NDArray, NDArray]:
+        """Distinct convergence points, and how many starts fell into each.
+
+        Clustering is deliberately crude — sort, then split wherever consecutive
+        convergence points differ by more than ``tolerance_nm``. The minima here
+        are separated by hundreds of nanometres and each is reached to about a
+        nanometre in a billion, so anything more elaborate would be answering a
+        question the data does not pose.
+        """
+        ordered = np.sort(self.thicknesses)
+        if ordered.size == 0:
+            return np.empty(0), np.empty(0, dtype=int)
+
+        edges = np.flatnonzero(np.diff(ordered) > tolerance_nm) + 1
+        groups = np.split(ordered, edges)
+        return (
+            np.array([group.mean() for group in groups]),
+            np.array([group.size for group in groups]),
+        )
+
+    @property
+    def success_fraction(self) -> float | None:
+        """Fraction of starts that reached the *right* answer, when truth is known.
+
+        The number §10 actually wants. A single fit reports ``success`` when the
+        optimiser is satisfied, which DTFM-030 showed says nothing about being
+        correct. This says how much of the prior a cold start can be drawn from
+        and still land on the truth — which is a property of the problem, not of
+        the optimiser's mood.
+        """
+        if self.truth is None:
+            return None
+        errors = np.abs(self.thicknesses - self.truth[0])
+        return float(np.mean(errors < 1.0))
+
+
+def multi_start_grid(
+    count: int = 12, prior: gen.Prior | None = None, *, spacing: str = "uniform"
+) -> NDArray[np.float64]:
+    """Thickness starting points spanning the prior's support.
+
+    **Spaced uniformly in thickness, not the way the prior samples**, and that
+    is the whole substance of this function.
+
+    The prior is log-uniform for a reason §7.1 sets out: each decade of thickness
+    deserves equal weight because the thin regime is where the problem is hard.
+    Seeding the *search* the same way is the obvious move and it is wrong. The
+    minima are not spread through the prior — they are periodic in thickness,
+    one per fringe, at
+
+        Δd = λ / (2 n cos θ_t) ≈ 600 / (2 × 1.46 × 0.765) ≈ 268 nm
+
+    for this band and geometry. That period does not care about thickness, so
+    over 20-2000 nm there are about 7 basins, evenly spread. A log grid puts half
+    its starts below 250 nm and leaves a 470 nm gap above 1500 — wider than a
+    fringe, so whole basins are never entered.
+
+    Measured, on 30 / 65 / 150 / 420 / 900 / 1500 / 1900 nm films:
+
+    | start spacing | starts | films recovered |
+    |---|---|---|
+    | log-uniform | 12 | 5 of 7 |
+    | log-uniform | 24 | 6 of 7 |
+    | **uniform** | **12** | **7 of 7** |
+
+    Doubling a log grid did not fix what changing its spacing fixed for free.
+    ``spacing`` is kept as an argument so that comparison stays runnable rather
+    than being a claim in a docstring.
+
+    The default of 12 follows from the period: 12 starts over 1980 nm sit 165 nm
+    apart, comfortably inside 268 nm, so every basin is entered at least once.
+
+    Endpoints are pulled inward — a start on a bound sits where the projection
+    clamps, and the fit can stall there instead of descending.
+    """
+    prior = prior or gen.Prior()
+    if count < 1:
+        raise ValueError(f"count must be at least 1, got {count}")
+    if spacing not in ("uniform", "log-uniform"):
+        raise ValueError(f"spacing must be 'uniform' or 'log-uniform', got {spacing!r}")
+
+    low, high = prior.thickness_nm
+    edge = 0.02
+    fractions = (np.arange(count) + 0.5) / count if count > 1 else np.array([0.5])
+    fractions = edge + fractions * (1.0 - 2.0 * edge)
+
+    if spacing == "log-uniform":
+        return np.exp(np.log(low) + fractions * (np.log(high) - np.log(low)))
+    return low + fractions * (high - low)
+
+
+def fit_multi_start(
+    observed: NDArray,
+    wavelengths_nm: NDArray,
+    *,
+    starts: NDArray | list[float] | None = None,
+    count: int = 12,
+    spacing: str = "uniform",
+    measurement: gen.Measurement | None = None,
+    prior: gen.Prior | None = None,
+    truth: NDArray | None = None,
+    method: str = "least_squares",
+    **fit_options,
+) -> MultiStartResult:
+    """§6's answer to multimodality: run the fit from many starts, keep them all.
+
+    DTFM-030 and DTFM-031 both established that a single cold-started fit reports
+    ``success`` while being hundreds of nanometres wrong, and that exact gradients
+    do not help because §5.2(b)'s ambiguity lives in the cost surface rather than
+    in the Jacobian. Only a different *search* can address it, and this is that
+    search — the cheapest one that works, and the one §6 names.
+
+    The winner is chosen by cost, which is the only criterion available when the
+    truth is not known. That is worth stating plainly: multi-start does not
+    *resolve* the ambiguity, it *surveys* it, and then bets on the deepest basin
+    found. On noiseless data the right basin is a trillion times deeper than any
+    rival, so the bet is safe. Under noise the margin shrinks, and how far it
+    shrinks is the question DTFM-033's covariance and §8's calibration exist to
+    answer.
+
+    Cost is the point, not an aside. §11's amortisation argument is that
+    classical inversion is expensive per site; a single fit takes tens of
+    milliseconds, and this multiplies that by ``count``. The wall clock recorded
+    here is the honest number for what a correct classical answer costs.
+
+    Dispersion starts are fixed at the prior's midpoint while thickness is swept.
+    Thickness is what is ambiguous — §5.2(b) is periodicity in ``n·d`` — and
+    sweeping three parameters would raise the cost by the cube for a landscape
+    that is one-dimensional in the interesting direction.
+    """
+    prior = prior or gen.Prior()
+    fitters = {"least_squares": fit_least_squares, "autograd": fit_autograd}
+    if method not in fitters:
+        raise ValueError(f"method must be one of {sorted(fitters)}, got {method!r}")
+    fitter = fitters[method]
+
+    if starts is None:
+        starts = multi_start_grid(count, prior, spacing=spacing)
+    starts = np.asarray(starts, dtype=float)
+
+    middle_a = 0.5 * (prior.cauchy_a[0] + prior.cauchy_a[1])
+    middle_b = 0.5 * (prior.cauchy_b[0] + prior.cauchy_b[1])
+
+    began = time.perf_counter()
+    fits = [
+        fitter(
+            observed,
+            wavelengths_nm,
+            [thickness, middle_a, middle_b],
+            measurement=measurement,
+            prior=prior,
+            truth=truth,
+            **fit_options,
+        )
+        for thickness in starts
+    ]
+    elapsed = time.perf_counter() - began
+
+    return MultiStartResult(
+        fits=fits,
+        starts=starts,
+        best_index=int(np.argmin([fit.cost for fit in fits])),
+        truth=None if truth is None else np.asarray(truth, dtype=float),
+        wall_clock_s=elapsed,
     )
