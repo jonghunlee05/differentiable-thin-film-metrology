@@ -32,6 +32,11 @@ __all__ = [
     "SellmeierFit",
     "fit_sellmeier",
     "sellmeier_n",
+    "HC_EV_NM",
+    "LorentzFit",
+    "fit_lorentz",
+    "lorentz_epsilon",
+    "lorentz_nk",
 ]
 
 _DATA_ROOT = pathlib.Path(__file__).resolve().parent.parent / "data" / "refractiveindex"
@@ -497,3 +502,175 @@ def _least_squares(residual, initial: NDArray, lower: NDArray, upper: NDArray) -
     from scipy.optimize import least_squares
 
     return least_squares(residual, initial, bounds=(lower, upper), method="trf").x
+
+
+# --- Lorentz oscillators, DTFM-022 -----------------------------------------
+
+#: Planck constant times the speed of light, in eV·nm. Converts wavelength to
+#: photon energy: Lorentz models are written in energy because the resonances
+#: are electronic transitions, which have energies rather than wavelengths.
+HC_EV_NM = 1239.841984
+
+
+@dataclass(frozen=True)
+class LorentzFit:
+    """A sum of Lorentz oscillators fitted to a measured dielectric function.
+
+    ``ε(E) = ε_∞ + Σ Aₖ/(Eₖ² − E² − iΓₖE)`` as §4.4 writes it, with energies in
+    electron-volts. ``Aₖ`` carries eV², ``Eₖ`` and ``Γₖ`` eV.
+
+    Unlike Cauchy and Sellmeier this describes **absorption**: the imaginary part
+    is not an afterthought but the reason the model exists. ``Γₖ`` is the width
+    of the absorption band, which is exactly what Sellmeier's bare pole lacks —
+    a pole has zero width and so absorbs at a single energy and nowhere else.
+    """
+
+    eps_inf: float
+    amplitudes: tuple[float, ...]
+    energies: tuple[float, ...]
+    widths: tuple[float, ...]
+    rms_residual_n: float
+    rms_residual_k: float
+    range_nm: tuple[float, float]
+
+    def __str__(self) -> str:  # pragma: no cover - convenience only
+        bands = ", ".join(
+            f"{e:.2f}±{g:.2f} eV" for e, g in zip(self.energies, self.widths, strict=True)
+        )
+        return (
+            f"Lorentz: eps_inf={self.eps_inf:.3f}, bands at {bands}; "
+            f"rms n {self.rms_residual_n:.2e}, k {self.rms_residual_k:.2e}"
+        )
+
+
+def lorentz_epsilon(coefficients, wavelengths_nm):
+    """Complex dielectric function ``ε = ε₁ + iε₂`` from §4.4's Lorentz sum.
+
+    Parameters
+    ----------
+    coefficients : a :class:`LorentzFit`, or ``(eps_inf, A, E, Γ)`` with the last
+        three as sequences — torch tensors included, so this stays
+        differentiable.
+
+    The sign of the ``iΓₖE`` term sets the convention: with ``−iΓₖE`` in the
+    denominator the imaginary part of ε comes out positive for a passive
+    material, which is the ``n + ik`` convention the rest of the project uses and
+    the one ``src.tmm_torch`` enforces.
+    """
+    if isinstance(coefficients, LorentzFit):
+        eps_inf = coefficients.eps_inf
+        amplitudes, energies, widths = (
+            coefficients.amplitudes,
+            coefficients.energies,
+            coefficients.widths,
+        )
+    else:
+        eps_inf, amplitudes, energies, widths = coefficients
+
+    energy = HC_EV_NM / wavelengths_nm
+    epsilon = eps_inf + 0.0j * energy
+    for a, e0, gamma in zip(amplitudes, energies, widths, strict=True):
+        epsilon = epsilon + a / (e0**2 - energy**2 - 1j * gamma * energy)
+    return epsilon
+
+
+def lorentz_nk(coefficients, wavelengths_nm):
+    """``(n, k)`` from the Lorentz model, via ``ñ = sqrt(ε)``.
+
+    The principal square root is the physical one here: for a passive material
+    ``Im(ε) >= 0``, and the principal root of such a number has ``Im(ñ) >= 0``,
+    which is absorption rather than gain. This is the same branch question as
+    DTFM-010 in a different guise, and it resolves the same way.
+    """
+    epsilon = lorentz_epsilon(coefficients, wavelengths_nm)
+    index = epsilon**0.5
+    return index.real, index.imag
+
+
+def fit_lorentz(
+    material: str,
+    wavelengths_nm: NDArray | list[float] | None = None,
+    *,
+    oscillators: int = 2,
+) -> LorentzFit:
+    """Fit §4.4's Lorentz model to the measured dielectric function.
+
+    Fitted against complex ``ε`` rather than against ``n`` and ``k`` separately:
+    ε is what the model is linear-ish in and what the oscillators physically
+    describe, and fitting the two parts jointly is what keeps the result
+    Kramers-Kronig consistent rather than merely close.
+
+    Multi-start over resonance positions, for the reason DTFM-021 discovered:
+    a single starting guess can leave an oscillator at zero strength and report
+    a plausible fit that is an order of magnitude worse than necessary.
+    """
+    if oscillators < 1:
+        raise ValueError(f"need at least one oscillator, got {oscillators}")
+
+    low_nm, high_nm = material_range_nm(material)
+    if wavelengths_nm is None:
+        wavelengths_nm = np.linspace(max(low_nm, 300.0), min(high_nm, 800.0), 200)
+    wavelengths_nm = np.asarray(wavelengths_nm, dtype=float)
+
+    n_data, k_data = load_nk(material, wavelengths_nm)
+    epsilon_data = (n_data + 1j * k_data) ** 2
+    energies_data = HC_EV_NM / wavelengths_nm
+
+    def unpack(parameters: NDArray):
+        eps_inf = parameters[0]
+        a = parameters[1 : 1 + oscillators]
+        e0 = parameters[1 + oscillators : 1 + 2 * oscillators]
+        gamma = parameters[1 + 2 * oscillators :]
+        return eps_inf, a, e0, gamma
+
+    def residual(parameters: NDArray) -> NDArray:
+        model = lorentz_epsilon(unpack(parameters), wavelengths_nm)
+        return np.concatenate([model.real - epsilon_data.real, model.imag - epsilon_data.imag])
+
+    span_low, span_high = float(energies_data.min()), float(energies_data.max())
+    best_solution, best_cost = None, np.inf
+    for centres in _lorentz_starts(oscillators, span_low, span_high):
+        initial = np.concatenate(
+            [[1.0], np.full(oscillators, 10.0), centres, np.full(oscillators, 0.5)]
+        )
+        lower = np.concatenate([[1.0], np.zeros(oscillators), np.full(oscillators, 0.1),
+                                np.full(oscillators, 1e-3)])
+        upper = np.concatenate([[np.inf], np.full(oscillators, np.inf),
+                                np.full(oscillators, 50.0), np.full(oscillators, 20.0)])
+
+        solution = _least_squares(residual, initial, lower, upper)
+        cost = float(np.sum(residual(solution) ** 2))
+        if cost < best_cost:
+            best_solution, best_cost = solution, cost
+
+    eps_inf, a, e0, gamma = unpack(best_solution)
+    order = np.argsort(e0)
+    n_model, k_model = lorentz_nk(
+        (float(eps_inf), tuple(a[order]), tuple(e0[order]), tuple(gamma[order])), wavelengths_nm
+    )
+
+    return LorentzFit(
+        eps_inf=float(eps_inf),
+        amplitudes=tuple(float(x) for x in a[order]),
+        energies=tuple(float(x) for x in e0[order]),
+        widths=tuple(float(x) for x in gamma[order]),
+        rms_residual_n=float(np.sqrt(np.mean((n_model - n_data) ** 2))),
+        rms_residual_k=float(np.sqrt(np.mean((k_model - k_data) ** 2))),
+        range_nm=(float(wavelengths_nm.min()), float(wavelengths_nm.max())),
+    )
+
+
+def _lorentz_starts(oscillators: int, low_ev: float, high_ev: float) -> list[NDArray]:
+    """Candidate resonance energies, in eV. Fixed rather than random, so the fit
+    is reproducible (§15).
+
+    Resonances are placed across the measured window and above it: a band just
+    beyond the data still shapes the dispersion inside it, which is why a fit
+    confined to what was measured misses structure that is really there.
+    """
+    starts = []
+    for top in (high_ev, high_ev * 1.3, high_ev * 1.8):
+        starts.append(np.linspace(low_ev + 0.2, top, oscillators))
+    for top in (high_ev * 1.1, high_ev * 1.5):
+        starts.append(np.linspace((low_ev + high_ev) / 2, top, oscillators))
+    return starts
