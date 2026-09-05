@@ -1408,3 +1408,65 @@ def test_energy_survives_a_thousand_layer_matrix_product(count):
     transmitted = pt.stack_transmittance(wavelength, thicknesses, indices, 0.0, "s")
 
     assert (reflected + transmitted - 1.0).abs().item() < 1e-12
+
+
+def test_as_complex_never_silently_discards_an_imaginary_part():
+    """Regression: numpy complex *arrays* used to lose their imaginary part.
+
+    `as_complex` decided complexity from the python type. A python complex and a
+    numpy complex *scalar* both satisfy `isinstance(x, complex)` — numpy's
+    complex128 subclasses it — but a numpy complex *array* does not. Such an
+    array was therefore built under a float dtype, which discards the imaginary
+    part with only a UserWarning.
+
+    The consequence would have been absorption vanishing from any
+    wavelength-dependent complex index: a Bruggeman roughness layer on an
+    absorbing film computes to a complex numpy array, and the stack would have
+    quietly treated it as transparent. Reflectance would still land in [0, 1] and
+    look entirely reasonable.
+
+    Found while building the DTFM-026 generator, from a warning that was easy to
+    dismiss as noise.
+    """
+    expected = [1.5 + 0.3j, 2.0 + 0.5j]
+
+    for value in (
+        np.array(expected),
+        np.array(expected, dtype=np.complex64),
+        list(expected),
+        expected[0],
+        np.complex128(expected[0]),
+        torch.tensor(expected, dtype=torch.complex128),
+    ):
+        promoted = pt.as_complex(value)
+        assert promoted.is_complex()
+        assert torch.any(promoted.imag != 0.0), f"imaginary part lost for {type(value).__name__}"
+
+    # real inputs must still work, and arrive with an exactly +0.0 imaginary part
+    for value in (1.5, np.array([1.5, 2.0]), torch.tensor([1.5, 2.0])):
+        promoted = pt.as_complex(value)
+        assert promoted.is_complex()
+        assert torch.all(promoted.imag == 0.0)
+        assert torch.all(torch.signbit(promoted.imag) == False)  # noqa: E712 - +0.0 not -0.0
+
+
+def test_a_rough_absorbing_film_keeps_its_absorption():
+    """The failure the regression above would have caused, at stack level.
+
+    An absorbing film with a Bruggeman roughness layer must still absorb. If the
+    mixture's imaginary part were dropped, A would collapse towards the value for
+    a transparent roughness layer and nothing would raise.
+    """
+    from src import noise as nz
+
+    wavelengths = torch.linspace(450.0, 750.0, 60, dtype=torch.float64)
+    absorbing_film = np.full(wavelengths.numel(), 1.5 + 0.08j)
+
+    thicknesses, indices = nz.add_surface_roughness([300.0], [1.0, absorbing_film, 3.88], 8.0)
+    roughness_index = indices[1]
+
+    assert np.iscomplexobj(roughness_index)
+    assert np.all(np.imag(roughness_index) > 1e-3), "the mixture should absorb"
+
+    absorbed = pt.stack_absorptance(wavelengths, thicknesses, indices, 0.0, "s")
+    assert torch.all(absorbed > 0.0)

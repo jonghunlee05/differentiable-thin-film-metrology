@@ -1,0 +1,31 @@
+# Default run configuration. Spec §15: reproducibility is a requirement, so every
+# run is driven from a file like this one and nothing is left implicit.
+
+spectrum:
+  low_nm: 400.0
+  high_nm: 800.0
+  points: 200          # §7.2 sizes the network input at ~200 values
+
+prior:
+  # §7.1 calls this a decision, not a detail. See src.generate.Prior for the
+  # reasoning; the short version is that DTFM-068 measured the thin-film
+  # departure as quadratic in thickness, so uniform sampling would leave almost
+  # no examples in the regime §8 and §10 exist to characterise.
+  spacing: log-uniform
+  thickness_nm: [20.0, 2000.0]
+  cauchy_a: [1.40, 1.55]
+  cauchy_b: [0.002, 0.012]
+  roughness_nm: [0.0, 4.0]
+  substrate: Si
+
+corruption:
+  # Four of §4.5's seven effects, the ones that are facts of life rather than
+  # faults. The remaining three are switched on deliberately by §10's atlas.
+  roughness_nm: 0.0    # sampled per film by the prior instead
+  bandwidth_fwhm_nm: 3.0
+  shot_scale: 0.003
+  read_sigma: 0.0005
+
+batch:
+  count: 64
+  seed: 0
