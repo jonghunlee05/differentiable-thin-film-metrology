@@ -27,6 +27,11 @@ dev = [
     "pytest==9.1.1",
     "tmm==0.2.0",
     "ruff==0.15.4",
+    # Notebooks are narrative (§15) but must stay executable, so the tooling to
+    # run them is pinned alongside everything else rather than assumed present.
+    "nbformat==5.11.1",
+    "nbclient==0.11.0",
+    "ipykernel==7.3.0",
 ]
 
 [tool.setuptools]
@@ -42,3 +47,8 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# This script embeds the notebook's markdown prose as string literals. Wrapping
+# a markdown table row to satisfy a line limit would break the rendered table.
+"scripts/build_notebook_01.py" = ["E501"]
