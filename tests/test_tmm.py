@@ -9,6 +9,7 @@ import cmath
 
 import numpy as np
 import pytest
+import tmm
 import torch
 
 from src import fresnel as np_fresnel
@@ -953,3 +954,104 @@ def test_the_null_degrades_away_from_normal_incidence(n_sub):
         torch.tensor(DESIGN_WAVELENGTH), [], [1.0, n_sub], 0.9, "s"
     ).item()
     assert values[-1] < bare
+
+
+# --- validation 3: agreement with the reference package, DTFM-016 -----------
+#
+# Spec §12, and the standing decision in §0.1: "write the forward model; import
+# `tmm` only to validate". This is the third and last of the required
+# validations, and the only one against an implementation written by someone
+# else — the previous two check the model against formulae this project also
+# transcribed, so a shared misreading of the physics would survive both.
+#
+# `tmm` is a dev-only dependency (see pyproject.toml) and `tests/test_smoke.py`
+# asserts no module under src/ imports it, so the standing decision is enforced
+# by packaging rather than by discipline.
+
+REFERENCE_STACKS = [
+    ("single dielectric film", [500.0], [1.0, 1.46, 3.88]),
+    ("two-layer AR coating", [120.0, 65.0], [1.0, 1.38, 2.30, 1.52]),
+    ("weakly absorbing film", [300.0], [1.0, 1.5 + 0.05j, 3.88]),
+    ("strongly absorbing stack", [80.0, 40.0, 200.0], [1.0, 1.5 + 0.05j, 2.3, 4.0 + 1.5j, 3.88]),
+    ("metal-like layer", [30.0, 300.0], [1.0, 0.15 + 3.5j, 1.46, 1.0]),
+    ("six alternating layers", [80.0, 100.0, 80.0, 100.0, 80.0, 100.0],
+     [1.0, 1.46, 2.3, 1.46, 2.3, 1.46, 2.3, 3.88]),
+]
+
+REFERENCE_ANGLES = [0.0, 0.3, 0.6, 1.0]
+REFERENCE_SPECTRUM = np.linspace(400.0, 800.0, 41)
+
+
+def _reference_r(pol, indices, thicknesses, theta_0, wavelength):
+    """Complex amplitude reflection coefficient from the `tmm` package."""
+    d_list = [np.inf, *thicknesses, np.inf]
+    return tmm.coh_tmm(pol, list(indices), d_list, theta_0, wavelength)["r"]
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("theta_0", REFERENCE_ANGLES)
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), REFERENCE_STACKS)
+def test_reflectance_matches_the_reference_package(name, thicknesses, indices, theta_0, pol):
+    """The acceptance criterion, across the swept spectrum."""
+    got = pt.stack_reflectance(
+        torch.tensor(REFERENCE_SPECTRUM), thicknesses, indices, theta_0, pol
+    ).numpy()
+    expected = np.array([
+        abs(_reference_r(pol, indices, thicknesses, theta_0, w)) ** 2
+        for w in REFERENCE_SPECTRUM
+    ])
+
+    assert np.allclose(got, expected, rtol=0, atol=1e-13), name
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("theta_0", REFERENCE_ANGLES)
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), REFERENCE_STACKS)
+def test_complex_amplitude_matches_the_reference_package(name, thicknesses, indices, theta_0, pol):
+    """Stronger than matching reflectance: this pins the phase.
+
+    |r|² discards the argument of r, so two models could agree on every measured
+    intensity while disagreeing on sign or phase — and §7.3's reconstruction
+    loss, §5.3's Jacobian and any future ellipsometry (§3, Ψ and Δ are defined
+    from r_p/r_s) all depend on the amplitude, not the intensity.
+    """
+    got = pt.stack_r(
+        torch.tensor(REFERENCE_SPECTRUM), thicknesses, indices, theta_0, pol
+    ).numpy()
+    expected = np.array([
+        _reference_r(pol, indices, thicknesses, theta_0, w) for w in REFERENCE_SPECTRUM
+    ])
+
+    assert np.allclose(got, expected, rtol=0, atol=1e-13), name
+
+
+def test_agreement_holds_at_the_quarter_wave_null():
+    """Agreement where the answer is ~0 rather than O(1).
+
+    An additive error of 1e-14 is invisible against a reflectance of 0.3 and
+    absolute in a null. Checking the sharpest feature the model produces is the
+    strictest form this comparison can take.
+    """
+    n_sub = 3.88
+    n_film, d = quarter_wave_coating(n_sub)
+    indices = [1.0, n_film, n_sub]
+
+    got = pt.stack_reflectance(torch.tensor(DESIGN_WAVELENGTH), [d], indices, 0.0, "s").item()
+    expected = abs(_reference_r("s", indices, [d], 0.0, DESIGN_WAVELENGTH)) ** 2
+
+    assert got < 1e-25 and expected < 1e-25
+
+
+def test_the_reference_package_is_not_a_runtime_dependency():
+    """§0.1: write the forward model; import theirs only to validate.
+
+    Enforced by packaging — `tmm` sits in the dev extra, so a src/ module
+    reaching for it would break a clean runtime install. `tests/test_smoke.py`
+    asserts the absence directly; this records why it matters here, where the
+    reference is actually used.
+    """
+    import src.tmm_torch as module
+
+    source = module.__loader__.get_source(module.__name__) or ""
+    assert "import tmm" not in source
+    assert "from tmm" not in source
