@@ -1055,3 +1055,117 @@ def test_the_reference_package_is_not_a_runtime_dependency():
     source = module.__loader__.get_source(module.__name__) or ""
     assert "import tmm" not in source
     assert "from tmm" not in source
+
+
+# --- energy conservation, DTFM-068 ------------------------------------------
+#
+# Added after E2 closed, from a sanity-check pass over the finished simulator.
+#
+# Every test before this one is about reflectance, so a whole class of error was
+# untested: a model that quietly created or destroyed energy would satisfy all of
+# them. R <= 1 is a bound; R + T + A = 1 is an equality, and equalities are much
+# harder to satisfy by accident.
+
+CONSERVING_STACKS = [
+    ("bare interface", [], [1.0, 1.52]),
+    ("single film", [300.0], [1.0, 1.46, 1.52]),
+    ("three layers", [120.0, 65.0, 200.0], [1.0, 1.38, 2.30, 1.46, 1.52]),
+    ("six layers", [80.0] * 6, [1.0, 1.46, 2.3, 1.46, 2.3, 1.46, 2.3, 1.52]),
+    ("high contrast", [90.0], [1.0, 2.6, 1.33]),
+]
+
+ABSORBING_STACKS = [
+    ("weak absorber", [400.0], [1.0, 1.5 + 0.02j, 1.52]),
+    ("strong absorber", [200.0], [1.0, 2.0 + 0.5j, 1.52]),
+    ("metal-like", [30.0], [1.0, 0.15 + 3.5j, 1.52]),
+    ("mixed", [80.0, 40.0, 150.0], [1.0, 1.46, 2.0 + 0.3j, 1.5 + 0.02j, 1.52]),
+]
+
+CONSERVATION_SPECTRUM = torch.linspace(400.0, 900.0, 120, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("theta_0", [0.0, 0.3, 0.7, 1.2])
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), CONSERVING_STACKS)
+def test_transparent_stacks_conserve_energy_exactly(name, thicknesses, indices, theta_0, pol):
+    """R + T = 1 with no absorption. An equality, so nothing can hide in it."""
+    reflected = pt.stack_reflectance(
+        CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol
+    )
+    transmitted = pt.stack_transmittance(
+        CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol
+    )
+
+    assert torch.allclose(reflected + transmitted, torch.ones_like(reflected), atol=1e-13), name
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize("theta_0", [0.0, 0.6])
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), ABSORBING_STACKS)
+def test_absorbing_stacks_never_emit(name, thicknesses, indices, theta_0, pol):
+    """A = 1 − R − T must stay non-negative.
+
+    This is DTFM-010's branch fix confirmed by a completely independent route:
+    energy accounting rather than inspecting the root of a square root. A wrong
+    branch would show up here as a stack that emits more light than it received.
+    """
+    absorbed = pt.stack_absorptance(CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol)
+
+    assert torch.all(absorbed >= -1e-12), name
+    assert torch.all(absorbed <= 1.0 + 1e-12), name
+
+
+def test_absorption_grows_with_thickness_and_saturates():
+    """A thicker absorbing film absorbs more, up to the point where nothing
+    reaches the substrate and the answer stops depending on thickness.
+    """
+    thicknesses = (10.0, 50.0, 200.0, 1000.0, 5000.0, 20000.0)
+    absorbed = [
+        pt.stack_absorptance(
+            torch.tensor(550.0, dtype=torch.float64), [d], [1.0, 1.5 + 0.1j, 1.52], 0.0, "s"
+        ).item()
+        for d in thicknesses
+    ]
+
+    assert all(a < b for a, b in zip(absorbed[:-1], absorbed[1:], strict=True))
+
+    # Saturation is not at A = 1: once nothing reaches the substrate, everything
+    # not reflected at the front face is absorbed, so A tends to 1 - R_front.
+    transmitted = pt.stack_transmittance(
+        torch.tensor(550.0, dtype=torch.float64), [20000.0], [1.0, 1.5 + 0.1j, 1.52], 0.0, "s"
+    ).item()
+    assert transmitted < 1e-12, "the film should be opaque by 20 um"
+    assert absorbed[-1] == pytest.approx(absorbed[-2], abs=1e-3), "and A should have levelled off"
+
+
+def test_transmittance_matches_the_reference_package():
+    """The flux correction between polarisations is easy to get wrong and would
+    still give a plausible number, so it is checked against `tmm` directly.
+    """
+    for name, thicknesses, indices in CONSERVING_STACKS[1:]:
+        for pol in POLARISATIONS:
+            for theta_0 in (0.0, 0.5):
+                got = pt.stack_transmittance(
+                    torch.tensor(550.0, dtype=torch.float64), thicknesses, indices, theta_0, pol
+                ).item()
+                expected = tmm.coh_tmm(
+                    pol, list(indices), [np.inf, *thicknesses, np.inf], theta_0, 550.0
+                )["T"]
+
+                assert got == pytest.approx(expected, abs=1e-13), f"{name} {pol} {theta_0}"
+
+
+def test_a_perfect_antireflection_coating_transmits_everything():
+    """The quarter-wave null of DTFM-015, seen from the other side.
+
+    If R = 0 and the stack is transparent, T must be exactly 1 — which is the
+    same claim as the null but stated in transmitted power, and it fails if the
+    flux correction above is wrong even though the null itself would not.
+    """
+    n_sub = 2.30
+    n_film, d = quarter_wave_coating(n_sub)
+    wavelength = torch.tensor(DESIGN_WAVELENGTH, dtype=torch.float64)
+
+    transmitted = pt.stack_transmittance(wavelength, [d], [1.0, n_film, n_sub], 0.0, "s")
+
+    assert transmitted.item() == pytest.approx(1.0, abs=1e-12)
