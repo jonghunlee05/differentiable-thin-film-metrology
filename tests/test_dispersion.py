@@ -470,3 +470,173 @@ def test_sellmeier_is_differentiable_in_its_coefficients():
 def test_at_least_one_oscillator_is_required():
     with pytest.raises(ValueError, match="at least one oscillator"):
         dp.fit_sellmeier("SiO2", oscillators=0)
+
+
+# --- Lorentz oscillators, DTFM-022 -----------------------------------------
+#
+# Spec §4.4 sends absorbing materials here, and it is the only one of the three
+# models with an imaginary part at all. Cauchy has none; Sellmeier's poles mark
+# where absorption is without describing it, because a bare pole has no width.
+# Γₖ is that width, and it is the whole difference.
+
+SI_TRANSPARENT_WINDOW = np.linspace(400.0, 800.0, 200)  # below silicon's E₁ point
+
+
+def test_lorentz_fits_an_absorbing_material_the_others_refuse():
+    """The reason the model exists.
+
+    `fit_cauchy("Si")` and `fit_sellmeier("Si")` both raise — neither has an
+    imaginary part. Lorentz describes the same data to 0.05% in n.
+    """
+    fit = dp.fit_lorentz("Si", SI_TRANSPARENT_WINDOW, oscillators=2)
+    n_data, _ = dp.load_nk("Si", SI_TRANSPARENT_WINDOW)
+
+    assert fit.rms_residual_n < 0.01
+    assert fit.rms_residual_n / n_data.mean() < 1e-3
+    assert fit.rms_residual_k < 0.02
+
+
+def test_the_fitted_bands_are_silicons_known_critical_points():
+    """E₁ at 3.4 eV and E₂ at 4.25 eV are textbook silicon band structure.
+
+    Fitting the dielectric function over 300-800 nm recovers both. As with
+    Sellmeier's resonance in DTFM-021, coefficients that land on independently
+    known physics are evidence the model is describing the material rather than
+    interpolating the numbers.
+    """
+    fit = dp.fit_lorentz("Si", np.linspace(300.0, 800.0, 200), oscillators=2)
+
+    assert fit.energies[0] == pytest.approx(3.4, abs=0.3)
+    assert fit.energies[1] == pytest.approx(4.25, abs=0.4)
+    assert all(g > 0.0 for g in fit.widths)
+
+
+def test_the_model_reproduces_absorption_not_just_the_index():
+    """k is the point. A model matching n while getting k wrong would satisfy a
+    naive residual and be useless for an absorbing stack.
+    """
+    fit = dp.fit_lorentz("Si", SI_TRANSPARENT_WINDOW, oscillators=2)
+    _, k_data = dp.load_nk("Si", SI_TRANSPARENT_WINDOW)
+    _, k_model = dp.lorentz_nk(fit, SI_TRANSPARENT_WINDOW)
+
+    assert np.all(k_model > 0.0)
+    assert np.corrcoef(k_model, k_data)[0, 1] > 0.99
+
+
+@pytest.mark.parametrize("material", ["Si", "TiO2"])
+def test_the_model_is_passive_everywhere(material):
+    """Im(ñ) >= 0, or the material amplifies light.
+
+    Guaranteed by the sign of the iΓE term and the principal square root — the
+    same branch question as DTFM-010 in another guise. `src.tmm_torch` rejects a
+    violation downstream; catching it here keeps the diagnosis local.
+    """
+    fit = dp.fit_lorentz(material, oscillators=2)
+    wavelengths = np.linspace(*fit.range_nm, 500)
+    _, k = dp.lorentz_nk(fit, wavelengths)
+
+    assert np.all(k >= 0.0)
+    assert np.all(np.isfinite(k))
+
+
+def test_fit_degrades_above_silicons_critical_points():
+    """The validity boundary, measured — as DTFM-020 did for Cauchy's edge.
+
+    A Lorentz oscillator is a broad, symmetric absorption band. Crystalline
+    silicon's E₁ and E₂ are sharp van Hove singularities in the joint density of
+    states, which a sum of Lorentzians cannot reproduce; the literature reaches
+    for Tauc-Lorentz or critical-point parabolic band models there.
+
+    Below E₁ the fit is good to 0.05% in n. Extend the window past it and the
+    error grows by two orders of magnitude — while still looking like a
+    dispersion curve, which is why the residual is reported.
+    """
+    below = dp.fit_lorentz("Si", np.linspace(500.0, 800.0, 200), oscillators=2)
+    across = dp.fit_lorentz("Si", np.linspace(250.0, 800.0, 200), oscillators=2)
+
+    assert below.rms_residual_n < 0.01
+    assert across.rms_residual_n > 50 * below.rms_residual_n
+
+
+def test_kramers_kronig_consistency():
+    """The note §4.4 asks for, checked numerically rather than asserted.
+
+    A Lorentz oscillator is a causal response function, so its real and
+    imaginary parts are not independent: either determines the other through
+
+        ε₁(E) − ε_∞ = (2/π) P ∫₀^∞ E' ε₂(E') / (E'² − E²) dE'
+
+    This test recovers ε₁ from ε₂ alone and compares. It matters beyond
+    elegance: it is why fitting n and k *jointly* against complex ε is the right
+    move, and why a model fitted only to n cannot be trusted for k. It is also
+    the physics behind §4.4's remark that Kramers-Kronig constrains n and k to
+    be consistent with each other.
+
+    The principal value is taken by subtraction — with g(E') = E'ε₂(E'), the
+    singular part cancels because P∫₀^∞ dE'/(E'²−E²) = 0 exactly — leaving a
+    removable integrand. Residual error is numerical (finite grid and finite
+    upper limit), not physical.
+    """
+    coefficients = (1.0, (12.0,), (3.4,), (0.6,))
+    grid = np.linspace(1e-6, 400.0, 400_001)
+
+    def epsilon_2(energies):
+        return dp.lorentz_epsilon(coefficients, dp.HC_EV_NM / energies).imag
+
+    g = grid * epsilon_2(grid)
+
+    def kk_epsilon_1(energy: float) -> float:
+        g_at = energy * epsilon_2(np.array([energy]))[0]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            integrand = (g - g_at) / (grid**2 - energy**2)
+        bad = ~np.isfinite(integrand)
+        integrand[bad] = np.interp(grid[bad], grid[~bad], integrand[~bad])
+        return 1.0 + (2.0 / np.pi) * np.trapezoid(integrand, grid)
+
+    for energy in (1.5, 2.0, 2.5, 4.0, 5.0):
+        direct = dp.lorentz_epsilon(coefficients, dp.HC_EV_NM / energy).real
+        assert kk_epsilon_1(energy) == pytest.approx(direct, rel=0.05)
+
+
+def test_lorentz_is_differentiable_in_its_coefficients():
+    """§7.1 samples dispersion parameters; §7.3 backpropagates through them."""
+    fit = dp.fit_lorentz("Si", SI_TRANSPARENT_WINDOW, oscillators=2)
+    amplitudes = torch.tensor(fit.amplitudes, dtype=torch.float64, requires_grad=True)
+    wavelengths = torch.linspace(450.0, 750.0, 40, dtype=torch.float64)
+
+    n, k = dp.lorentz_nk(
+        (fit.eps_inf, amplitudes, torch.tensor(fit.energies), torch.tensor(fit.widths)),
+        wavelengths,
+    )
+    (n.sum() + k.sum()).backward()
+
+    assert torch.all(torch.isfinite(amplitudes.grad))
+    assert torch.any(amplitudes.grad != 0.0)
+
+
+def test_a_lorentz_film_drives_the_forward_model():
+    """An absorbing film described by fitted parameters, through the stack.
+
+    This is the combination DTFM-010's branch guard exists for: a complex index
+    from a fitted model, inside a multilayer, with gradients flowing back to the
+    oscillator strengths.
+    """
+    fit = dp.fit_lorentz("Si", SI_TRANSPARENT_WINDOW, oscillators=2)
+    amplitudes = torch.tensor(fit.amplitudes, dtype=torch.float64, requires_grad=True)
+    wavelengths = torch.linspace(500.0, 800.0, 120, dtype=torch.float64)
+
+    n, k = dp.lorentz_nk(
+        (fit.eps_inf, amplitudes, torch.tensor(fit.energies), torch.tensor(fit.widths)),
+        wavelengths,
+    )
+    R = pt.stack_reflectance(wavelengths, [80.0], [1.0, n + 1j * k, 1.46], 0.0, "s")
+    R.sum().backward()
+
+    assert torch.all((R >= 0.0) & (R <= 1.0))
+    assert torch.all(torch.isfinite(amplitudes.grad))
+    assert torch.any(amplitudes.grad != 0.0)
+
+
+def test_at_least_one_lorentz_oscillator_is_required():
+    with pytest.raises(ValueError, match="at least one oscillator"):
+        dp.fit_lorentz("Si", oscillators=0)
