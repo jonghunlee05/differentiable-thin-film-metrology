@@ -426,3 +426,177 @@ def test_polarisation_argument_is_validated():
     """A typo must fail loudly rather than silently selecting s."""
     with pytest.raises(ValueError, match="must be 's' or 'p'"):
         pt.interface_matrix(1.0, 1.46, torch.tensor(0.3), "S")
+
+
+# --- the full stack, DTFM-012 -----------------------------------------------
+#
+# Spec §4.3. M = I_01·L_1·I_12·…·I_{N−1,N}, then r = M[1,0]/M[0,0].
+#
+# This is the forward model everything downstream depends on: the dataset
+# generator of §7.1, the classical fit of §6, and the reconstruction loss of
+# §7.3 all call it. The tests below assert physical properties — limits,
+# periodicities, conservation — rather than reproducing the arithmetic.
+
+SPECTRUM = torch.linspace(400.0, 800.0, 51)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+@pytest.mark.parametrize(("n_i", "n_j"), INDEX_PAIRS)
+def test_stack_with_no_layers_is_the_bare_interface(n_i, n_j, pol):
+    """The limit that ties the stack to the already-validated §4.2 result."""
+    theta = torch.tensor(THETA)
+    got = pt.stack_reflectance(WAVELENGTH, [], [n_i, n_j], theta, pol)
+    expected = pt.reflectance(n_i, n_j, theta)[POLARISATIONS.index(pol)]
+
+    assert torch.allclose(got, expected, atol=1e-13)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+def test_zero_thickness_layer_vanishes_from_the_stack(pol):
+    """A layer of no thickness must be indistinguishable from no layer.
+
+    Stronger than DTFM-011's identity check: that showed L = I in isolation,
+    this shows the surrounding interface matrices then collapse correctly too,
+    which is a statement about the whole product rather than one factor.
+    """
+    for angle in (0.0, 0.4, 1.2):
+        with_layer = pt.stack_reflectance(WAVELENGTH, [0.0], [1.0, 2.3, 3.88], angle, pol)
+        without = pt.stack_reflectance(WAVELENGTH, [], [1.0, 3.88], angle, pol)
+        assert torch.allclose(with_layer, without, atol=1e-12)
+
+
+@pytest.mark.parametrize("n_layers", [1, 2, 3, 5, 8])
+def test_arbitrary_layer_count(n_layers):
+    """The acceptance criterion: no fixed stack depth anywhere."""
+    indices = [1.0] + [1.46 if k % 2 else 2.3 for k in range(n_layers)] + [3.88]
+    thicknesses = [80.0 + 20.0 * k for k in range(n_layers)]
+
+    R = pt.stack_reflectance(SPECTRUM, thicknesses, indices, 0.0, "s")
+
+    assert R.shape == SPECTRUM.shape
+    assert torch.all(torch.isfinite(R))
+    assert torch.all((R >= 0.0) & (R <= 1.0))
+
+
+def test_s_and_p_coincide_at_normal_incidence():
+    """The acceptance criterion, and a real constraint on the p convention.
+
+    At θ=0 there is no plane of incidence to distinguish the polarisations, so
+    the two must give identical reflectance. The §4.2 sign convention makes r_p
+    differ from r_s by a sign here, which |r|² removes — a convention error in
+    the stack product would not survive this.
+    """
+    indices = [1.0, 1.46, 2.3, 3.88]
+    thicknesses = [120.0, 65.0]
+
+    R_s = pt.stack_reflectance(SPECTRUM, thicknesses, indices, 0.0, "s")
+    R_p = pt.stack_reflectance(SPECTRUM, thicknesses, indices, 0.0, "p")
+
+    assert torch.allclose(R_s, R_p, atol=1e-13)
+
+
+def test_s_and_p_differ_away_from_normal_incidence():
+    """Guards the previous test: if the two paths were accidentally identical,
+    that test would pass for the wrong reason.
+    """
+    R_s = pt.stack_reflectance(SPECTRUM, [120.0], [1.0, 1.46, 3.88], 0.9, "s")
+    R_p = pt.stack_reflectance(SPECTRUM, [120.0], [1.0, 1.46, 3.88], 0.9, "p")
+
+    assert not torch.allclose(R_s, R_p, atol=1e-3)
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+def test_reflectance_is_periodic_in_optical_thickness(pol):
+    """The fringe-order ambiguity of §5.2(b), at full-stack level.
+
+    Two thicknesses differing by λ/(2n cosθ) produce identical spectra. This is
+    the degeneracy the project exists to characterise: the measurement cannot
+    distinguish them, so any estimator claiming to have done so is claiming
+    information the physics does not contain.
+    """
+    n, theta = 1.46, 0.0
+    period = WAVELENGTH / (2.0 * n * np.cos(theta))
+
+    for d in (40.0, 137.0, 260.0):
+        base = pt.stack_reflectance(WAVELENGTH, [d], [1.0, n, 3.88], theta, pol)
+        for k in (1, 2, 5):
+            shifted = pt.stack_reflectance(
+                WAVELENGTH, [d + k * period], [1.0, n, 3.88], theta, pol
+            )
+            assert torch.allclose(base, shifted, atol=1e-10)
+
+
+def test_a_thick_absorbing_layer_hides_the_substrate():
+    """A physical degeneracy worth pinning: you cannot see through an opaque film.
+
+    As absorption accumulates, what lies beneath stops affecting the spectrum.
+    Two stacks differing only in substrate become numerically identical — an
+    unmeasurable parameter, of exactly the kind §10's failure atlas catalogues.
+    """
+    n_abs = 1.5 + 0.3j
+    previous = None
+
+    for d in (100.0, 500.0, 2000.0):
+        on_silicon = pt.stack_reflectance(WAVELENGTH, [d], [1.0, n_abs, 3.88], 0.0, "s")
+        on_air = pt.stack_reflectance(WAVELENGTH, [d], [1.0, n_abs, 1.0], 0.0, "s")
+        difference = (on_silicon - on_air).abs().item()
+
+        if previous is not None:
+            assert difference < previous
+        previous = difference
+
+    assert previous < 1e-6
+
+
+@pytest.mark.parametrize("pol", POLARISATIONS)
+def test_passive_stacks_never_reflect_more_than_they_receive(pol):
+    """Energy conservation across absorbing multilayers — the broadest single
+    check that no sign or branch error has crept into the product.
+    """
+    stacks = [
+        ([120.0], [1.0, 1.46, 3.88]),
+        ([120.0, 65.0], [1.0, 1.46, 2.3, 3.88]),
+        ([80.0, 40.0, 200.0], [1.0, 1.5 + 0.05j, 2.3, 4.0 + 1.5j, 3.88]),
+        ([30.0, 300.0], [1.0, 0.15 + 3.5j, 1.46, 1.0]),
+    ]
+    for thicknesses, indices in stacks:
+        for angle in (0.0, 0.5, 1.3):
+            R = pt.stack_reflectance(SPECTRUM, thicknesses, indices, angle, pol)
+            assert torch.all(R >= 0.0)
+            assert torch.all(R <= 1.0 + 1e-12)
+
+
+def test_stack_produces_fringes_rather_than_a_flat_spectrum():
+    """The whole point of the measurement. A forward model returning a smooth
+    curve would satisfy every bound above and encode no thickness at all.
+    """
+    R = pt.stack_reflectance(SPECTRUM, [500.0], [1.0, 1.46, 3.88], 0.0, "s")
+    turning_points = ((R[1:-1] - R[:-2]) * (R[2:] - R[1:-1]) < 0).sum().item()
+
+    assert turning_points >= 2, "no interference structure — the layer phase is not acting"
+    assert (R.max() - R.min()).item() > 0.1
+
+
+def test_gradients_flow_through_the_whole_stack():
+    """§7.3's reconstruction loss differentiates the forward model end to end.
+
+    ∂R/∂d against finite differences is DTFM-017's check; this asserts only that
+    the path exists and is finite.
+    """
+    d = torch.tensor([120.0, 65.0], dtype=torch.float64, requires_grad=True)
+    R = pt.stack_reflectance(SPECTRUM, [d[0], d[1]], [1.0, 1.46, 2.3, 3.88], 0.3, "s")
+    R.sum().backward()
+
+    assert torch.all(torch.isfinite(d.grad))
+    assert torch.all(d.grad != 0.0)
+
+
+def test_layer_count_mismatch_is_rejected():
+    """Ambient and substrate are semi-infinite and take no thickness. Getting
+    that off by one silently would shift every layer's phase.
+    """
+    with pytest.raises(ValueError, match="expected 1"):
+        pt.stack_reflectance(WAVELENGTH, [100.0, 200.0], [1.0, 1.46, 3.88], 0.0, "s")
+
+    with pytest.raises(ValueError, match="at least an ambient"):
+        pt.stack_reflectance(WAVELENGTH, [], [1.0], 0.0, "s")
