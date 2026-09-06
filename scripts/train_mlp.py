@@ -97,7 +97,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=8000)
     parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--arch", default="mlp", choices=["mlp", "cnn"])
     parser.add_argument("--width", type=int, default=256)
+    parser.add_argument("--channels", type=int, default=32, help="cnn only")
+    parser.add_argument("--kernel", type=int, default=7, help="cnn only")
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
@@ -111,14 +114,24 @@ def main() -> int:
 
     torch.manual_seed(args.seed)
     prior = gen.Prior()
-    model = models.build_model(
-        {"width": args.width, "depth": args.depth, "output_margin": args.margin}, prior=prior
-    )
+    settings = {
+        "architecture": args.arch,
+        "depth": args.depth,
+        "output_margin": args.margin,
+        "width": args.width if args.arch == "mlp" else 128,
+    }
+    if args.arch == "cnn":
+        settings |= {"channels": args.channels, "kernel": args.kernel}
+    model = models.build_model(settings, prior=prior)
     scaler = model.scale_theta
     print(
-        f"  {model.parameter_count:,} parameters  "
-        f"(width {args.width}, depth {args.depth}, lr {args.lr}, batch {args.batch},"
-        f" margin {args.margin})"
+        f"  {args.arch.upper()}: {model.parameter_count:,} parameters  "
+        f"(depth {args.depth}, lr {args.lr}, batch {args.batch}, margin {args.margin}"
+        + (
+            f", channels {args.channels}, kernel {args.kernel})"
+            if args.arch == "cnn"
+            else f", width {args.width})"
+        )
     )
 
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -221,7 +234,9 @@ def main() -> int:
             "seed": args.seed,
             "margin": args.margin,
             "parameters": model.parameter_count,
-            "architecture": "mlp",
+            "architecture": args.arch,
+            "channels": args.channels if args.arch == "cnn" else None,
+            "kernel": args.kernel if args.arch == "cnn" else None,
         },
         {
             **report,

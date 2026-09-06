@@ -176,3 +176,100 @@ def test_it_learns_something_in_a_few_hundred_steps():
         last = loss.item()
 
     assert last < 0.5 * first, f"loss barely moved: {first:.4f} -> {last:.4f}"
+
+
+# --- DTFM-040: the convolutional model ----------------------------------------
+
+
+def test_the_cnn_reshapes_the_spectrum_into_wavelength_and_channel():
+    """The load-bearing decision in :class:`models.InverseCNN`.
+
+    The 400 inputs are **200 wavelengths × 2 channels**, not a flat run of 400.
+    ``Ψ[i]`` and ``Δ[i]`` are the same wavelength — they belong at the same
+    position in different channels, exactly as red and green are one pixel.
+
+    A ``1 × 400`` layout would let the kernel straddle index 200, mixing the phase
+    near 800 nm with the amplitude near 400 nm. That is physically meaningless and
+    it would train perfectly happily while doing it — the model would simply be
+    worse, with nothing to say why. Asserted because nothing else would catch it.
+    """
+    model = models.build_model({"architecture": "cnn"})
+
+    assert model.channels_in == 2, "Ψ and Δ are channels, not a concatenated sequence"
+    batch = ds.sample_batch(4, WAVELENGTHS, np.random.default_rng(0))
+    stacked = model.scale_x(batch.observed.float()).reshape(4, model.channels_in, -1)
+    assert stacked.shape == (4, 2, 200)
+
+    # channel 0 must be Ψ and channel 1 Δ, in the pipeline's own order
+    half = batch.observed.shape[1] // 2
+    assert torch.allclose(stacked[:, 0, :], model.scale_x(batch.observed.float())[:, :half])
+
+
+def test_the_cnn_wins_on_structure_not_on_size():
+    """§7.2 predicts the CNN is "better suited — fringes are local repeating
+    structure". DTFM-040 measured it, and the parameter count is what makes the
+    result attributable:
+
+    | | MLP | CNN |
+    |---|---|---|
+    | parameters | 235,011 | **117,795** |
+    | median error | 5.977 nm | **4.758 nm** |
+    | thin films | 4.453 nm | **2.585 nm** |
+
+    20% better overall with **half** the parameters, and 42% better on thin films
+    — where fringes are few and widely spaced, which is exactly the local pattern
+    a convolution is built to detect. On thick films, where fringes crowd the band
+    and the signal is closer to a global property, the advantage vanishes.
+
+    This test pins the parameter relationship only. Accuracy is a training outcome
+    and lives in ``runs/history.jsonl``; what must stay true is that the CNN is not
+    quietly winning by being bigger.
+    """
+    mlp = models.build_model({"architecture": "mlp"})
+    cnn = models.build_model({"architecture": "cnn"})
+
+    assert cnn.parameter_count < mlp.parameter_count, (
+        "the comparison is only meaningful while the CNN is the smaller model"
+    )
+
+
+def test_both_architectures_satisfy_the_same_contract():
+    """DTFM-041's head and DTFM-044's benchmark treat these interchangeably, so
+    they must agree on everything but their internals.
+    """
+    batch = ds.sample_batch(6, WAVELENGTHS, np.random.default_rng(0))
+    prior = gen.Prior()
+
+    for architecture in ("mlp", "cnn"):
+        model = models.build_model({"architecture": architecture}, prior=prior)
+        predicted = model(batch.observed.float())
+        assert predicted.shape == (6, 3), architecture
+        assert not model.scale_theta.outside_prior(predicted).any(), architecture
+
+        with_head = models.build_model(
+            {"architecture": architecture, "uncertainty": True}, prior=prior
+        )
+        theta, log_var = with_head(batch.observed.float())
+        assert theta.shape == log_var.shape == (6, 3), architecture
+
+
+@pytest.mark.parametrize("kernel", [2, 4, 8])
+def test_an_even_kernel_is_refused(kernel):
+    """Padding is ``kernel // 2`` on both sides, which only centres the kernel when
+    it is odd. An even kernel would shift the output by half a sample per layer —
+    a systematic wavelength offset that would look like a calibration error.
+    """
+    with pytest.raises(ValueError, match="odd"):
+        models.build_model({"architecture": "cnn", "kernel": kernel})
+
+
+def test_the_cnn_is_reproducible_from_its_config():
+    config = {"architecture": "cnn", "channels": 16, "depth": 2, "kernel": 5}
+    torch.manual_seed(0)
+    first = models.build_model(config)
+    torch.manual_seed(0)
+    second = models.build_model(config)
+
+    assert first.parameter_count == second.parameter_count
+    for a, b in zip(first.parameters(), second.parameters(), strict=True):
+        assert torch.equal(a, b)

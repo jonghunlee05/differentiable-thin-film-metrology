@@ -56,7 +56,8 @@ batch:
 # "do not reach for a transformer" — architecture novelty is not what is being
 # assessed, and the interesting question is DTFM-041's uncertainty head, not this.
 model:
-  architecture: mlp       # 'cnn' arrives at DTFM-040
+  architecture: mlp       # or 'cnn' — DTFM-040 measured the CNN 20% better with
+                          # HALF the parameters, and 42% better on thin films
   input_size: 400         # 200 psi + 200 delta, from the spectrum block above
   width: 256
   depth: 3
@@ -68,6 +69,14 @@ model:
   # The loss is only about half thickness, so it improved on the other half.
   # Kept at 0 because the guarantee is worth more than a loss number.
   output_margin: 0.0
+
+  # CNN only (architecture: cnn). The 400 inputs are reshaped to 200 wavelengths
+  # x 2 channels — Psi[i] and Delta[i] are the SAME wavelength and belong at the
+  # same position, as red and green are one pixel. Flattening to 1x400 instead
+  # would let the kernel straddle index 200, mixing the phase near 800 nm with
+  # the amplitude near 400 nm. It would train happily while doing it.
+  channels: 32
+  kernel: 7               # odd, so padding stays symmetric
 
 training:
   steps: 8000             # ~2M films; past a few million the physics is re-learnt
