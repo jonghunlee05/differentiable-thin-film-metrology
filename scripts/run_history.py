@@ -44,16 +44,23 @@ def main() -> int:
         return 0
 
     print(f"\n  {len(runs)} run(s) recorded\n")
-    header = (
-        f"  {'#':>2} {'width':>6} {'depth':>6} {'lr':>8} {'batch':>6} {'steps':>7}"
-        f" {'median nm':>10} {'wrong>1nm':>10} {'thin':>8} {'thick':>8} {'us/film':>8}"
+    # `when` and `arch` lead because they are what a reader needs to place a row.
+    # Two runs with identical settings are not identical results: an MLP and a CNN
+    # share every column below `arch`, and timing columns are only comparable
+    # between runs made on the same machine at the same time — which the date is
+    # the only way to tell.
+    print(
+        f"  {'#':>2} {'when':<16} {'arch':<5} {'width':>6} {'depth':>6} {'lr':>8}"
+        f" {'batch':>6} {'steps':>7} {'median nm':>10} {'wrong>1nm':>10}"
+        f" {'thin':>8} {'thick':>8} {'us/film':>8}"
     )
-    print(header)
     best = min(runs, key=lambda r: r["median_nm"])
     for i, run in enumerate(runs, 1):
         mark = " <-- best" if run is best else ""
+        when = run.get("when", "")[:16].replace("T", " ")
         print(
-            f"  {i:2d} {run['width']:6d} {run['depth']:6d} {run['lr']:8.1e}"
+            f"  {i:2d} {when:<16} {run.get('architecture', '?'):<5}"
+            f" {run['width']:6d} {run['depth']:6d} {run['lr']:8.1e}"
             f" {run['batch']:6d} {run['steps']:7d} {run['median_nm']:10.3f}"
             f" {100 * run['wrong_over_1nm']:9.1f}% {run.get('median_thin', float('nan')):8.2f}"
             f" {run.get('median_thick', float('nan')):8.2f} {run['inference_us']:8.1f}{mark}"

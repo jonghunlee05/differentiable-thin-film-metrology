@@ -1,0 +1,29 @@
+# A sweep: every field under `sweep` is expanded as a Cartesian product, and
+# everything else is inherited.
+#
+#   python scripts/train.py --config configs/sweep.yaml --list    # what it will run
+#   python scripts/train.py --config configs/sweep.yaml --sweep   # locally, in sequence
+#   gh workflow run sweep.yml                                     # on GitHub, in parallel
+#
+# Run it on GitHub rather than a laptop. A CNN run pegs every core for 25 minutes;
+# a sweep runs for hours, and a throttling laptop makes LATER runs slower than
+# earlier ones, which corrupts any timing comparison. GitHub's matrix runs them in
+# parallel on separate machines, and none of it is on your hardware.
+#
+# THIS FILE DESCRIBES 4 RUNS, NOT 8. The product below has eight combinations and
+# four of them are duplicates: an MLP ignores `channels`, a CNN ignores `width`, so
+# `mlp width=128 channels=16` and `mlp width=128 channels=32` are the same network
+# trained twice from the same seed. `expand_sweep` drops the repeats. Always check
+# with `--list` before starting a sweep — the duplicates would not have looked like
+# waste, they would have looked like machines reproducing each other.
+
+depth: 3
+steps: 8000
+batch: 256
+lr: 1.0e-3
+seed: 0
+
+sweep:
+  architecture: [mlp, cnn]
+  width: [128, 256]        # mlp only; ignored by cnn runs
+  channels: [16, 32]       # cnn only; ignored by mlp runs

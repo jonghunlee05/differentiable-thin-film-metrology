@@ -1,0 +1,94 @@
+# Training sweeps, on GitHub's hardware rather than a laptop — DTFM-043.
+#
+#   gh workflow run sweep.yml
+#   gh workflow run sweep.yml -f config=configs/sweep.yaml -f runs=4
+#
+# or press "Run workflow" in the Actions tab, from any device.
+#
+# Why this exists. A CNN run pegs every core for 25 minutes and a sweep runs for
+# hours. On a laptop that means heat and thermal throttling — which also makes
+# LATER runs in a sweep slower than earlier ones, quietly corrupting any timing
+# comparison. Here each run gets its own machine, they run in parallel, and the
+# laptop can be closed.
+#
+# The 6-hour limit is PER JOB, not per sweep, so a parallel matrix effectively
+# removes it. Public repositories get unlimited minutes and up to 20 concurrent
+# jobs.
+
+name: Sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Sweep config to run"
+        default: "configs/sweep.yaml"
+      runs:
+        description: "How many entries of the sweep to run (matrix size)"
+        default: "4"
+
+jobs:
+  # The matrix has to be literal YAML, so this job turns the requested count into
+  # a list of indices that `--only` consumes. It also fails early if the config
+  # describes fewer runs than were asked for, rather than after four jobs have
+  # started and one has nothing to do.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      indices: ${{ steps.build.outputs.indices }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install CPU-only torch
+        run: pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e .
+      - id: build
+        run: |
+          python scripts/train.py --config "${{ inputs.config }}" --list | tee plan.txt
+          total=$(wc -l < plan.txt)
+          want=${{ inputs.runs }}
+          if [ "$want" -gt "$total" ]; then
+            echo "asked for $want runs, but ${{ inputs.config }} describes $total." >&2
+            echo "Sweep entries that differ only in a field their architecture ignores" >&2
+            echo "are deduplicated, so a config can describe fewer runs than it looks." >&2
+            exit 1
+          fi
+          # `python`, not `jq`: the interpreter is already installed and pinned by
+          # this job, so this line can be checked locally. jq is only preinstalled
+          # by convention, and a line that cannot be run off CI is a line that
+          # first runs in anger.
+          indices=$(python -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$want")
+          echo "indices=$indices" >> "$GITHUB_OUTPUT"
+
+  train:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # one bad configuration must not cancel the rest
+      matrix:
+        index: ${{ fromJson(needs.plan.outputs.indices) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install CPU-only torch
+        run: pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e .
+
+      - name: Train
+        run: python scripts/train.py --config "${{ inputs.config }}" --only ${{ matrix.index }}
+
+      # Weights and results both. DTFM-039 and DTFM-040 produced three trained
+      # networks and all three were lost to process exit; the metrics survived
+      # and the models did not. `runs/` is gitignored, so an artifact is how a
+      # trained model leaves the machine that made it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ matrix.index }}
+          path: runs/
+          retention-days: 90
