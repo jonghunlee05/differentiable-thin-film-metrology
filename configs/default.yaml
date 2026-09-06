@@ -1,6 +1,20 @@
 # Default run configuration. Spec §15: reproducibility is a requirement, so every
 # run is driven from a file like this one and nothing is left implicit.
 
+# Instrument model, DTFM-034. These numbers were judgement calls until they were
+# checked against a real tool; they are now anchored to the J.A. Woollam M-2000
+# spectroscopic ellipsometer, the standard instrument for this measurement.
+#   range      371-1689 nm (193-1000 nm on the M-2000D variant)
+#   resolution ~3 nm in the UV-VIS, ~6 nm in the NIR
+#   sampling   "hundreds" of wavelengths, CCD-collected in one shot
+#   claimed    thickness repeatability better than 0.1 nm; n,k better than 0.001
+# https://www.jawoollam.com/products/m-2000-ellipsometer
+# https://www.vanderbilt.edu/vinse/instrumentation/spectroscopic-ellipsometer/
+#
+# 400-800 nm is a deliberate subset of the real range: the visible band alone,
+# where the vendored Si data is valid (206-827 nm) and where §5.2's degeneracies
+# are sharpest. 200 points sits at the low end of "hundreds", which DTFM-034
+# found matters - the bound oscillates on a scale set by the grid step.
 spectrum:
   low_nm: 400.0
   high_nm: 800.0
