@@ -31,6 +31,8 @@ from src import tmm_torch as pt
 
 __all__ = [
     "FitResult",
+    "covariance_from_jacobian",
+    "model_jacobian",
     "MultiStartResult",
     "fit_multi_start",
     "multi_start_grid",
@@ -65,6 +67,51 @@ class FitResult:
     residual_rms: float
     message: str
     initial: NDArray[np.float64] = field(repr=False)
+    covariance: NDArray[np.float64] | None = field(default=None, repr=False)
+    noise_sigma: float | None = None
+
+    @property
+    def standard_errors(self) -> NDArray[np.float64] | None:
+        """One-sigma uncertainty on each parameter — §15's non-negotiable.
+
+        **Local, and that word is load-bearing.** These come from the curvature of
+        the cost at the point the fit stopped, so they describe the width of the
+        basin it landed in. They know nothing about a rival basin 583 nm away. A
+        wrong-fringe fit reports a small, confident error bar; what exposes it is
+        the residual, not this. ``test_baseline.py`` measures exactly that, because
+        an error bar whose limits are not stated is worse than none.
+        """
+        if self.covariance is None:
+            return None
+        return np.sqrt(np.clip(np.diag(self.covariance), 0.0, None))
+
+    @property
+    def thickness_sigma_nm(self) -> float | None:
+        errors = self.standard_errors
+        return None if errors is None else float(errors[0])
+
+    @property
+    def correlation(self) -> NDArray[np.float64] | None:
+        """§5.3's ρ, which the spec calls the thing separating a metrologist from
+        someone who called ``curve_fit``. ρ(d, n) here routinely exceeds 0.99.
+        """
+        if self.covariance is None:
+            return None
+        scale = np.sqrt(np.clip(np.diag(self.covariance), 1e-300, None))
+        return self.covariance / np.outer(scale, scale)
+
+    @property
+    def condition_number(self) -> float | None:
+        """How close the fit is to being unable to separate its parameters.
+
+        §5.2's degeneracies show up here before they show up in an error bar. A
+        large value means the covariance was obtained by inverting a nearly
+        singular matrix, and the individual standard errors are then far less
+        trustworthy than their size suggests.
+        """
+        if self.covariance is None:
+            return None
+        return float(np.linalg.cond(self.covariance))
 
     @property
     def error(self) -> NDArray[np.float64] | None:
@@ -121,6 +168,73 @@ def wrapped_residual(model: NDArray, observed: NDArray, observable: str) -> NDAr
     return np.concatenate([difference[:half], delta_part])
 
 
+def model_jacobian(
+    parameters,
+    wavelengths_nm: NDArray,
+    measurement: gen.Measurement,
+    substrate: torch.Tensor,
+) -> NDArray[np.float64]:
+    """``J[i, k] = ∂f(λ_i) / ∂θ_k`` at ``parameters``, from autograd.
+
+    §5.3's Jacobian, taken exactly rather than by finite differences. ``scipy``
+    returns its own approximate ``jac`` at the solution and it would have been
+    less code to use it, but DTFM-031 established the model can hand over the
+    exact derivative — and an error bar built on a differencing step size is an
+    error bar with an arbitrary constant in it.
+
+    The Δ wrap does not enter. Wrapping shifts the residual by a multiple of 2π,
+    which is locally constant, so the derivative of the wrapped residual equals
+    the derivative of the model everywhere except on the seam itself.
+    """
+    theta = torch.as_tensor(np.asarray(parameters, dtype=float)).clone()
+
+    def observable(values: torch.Tensor) -> torch.Tensor:
+        return forward_observable(values, wavelengths_nm, measurement, substrate)
+
+    return torch.autograd.functional.jacobian(observable, theta).numpy()
+
+
+def covariance_from_jacobian(
+    jacobian: NDArray,
+    residual: NDArray,
+    *,
+    sigma: float | None = None,
+    rcond: float = 1e-12,
+) -> tuple[NDArray[np.float64], float]:
+    """§5.3's ``C = σ²(JᵀJ)⁻¹``, and the noise scale it was computed with.
+
+    Two ways to get ``σ``, and the choice matters:
+
+    ``sigma`` given
+        The instrument's own noise figure — what a metrologist has from the tool
+        specification. Believed as stated.
+    ``sigma`` omitted
+        Estimated from the fit itself as ``s² = RSS / (m − n)``. Honest when the
+        instrument figure is unknown, and badly optimistic when the model is
+        wrong: a systematic error the model cannot represent inflates the
+        residual, so ``s`` absorbs it and the error bar grows to cover a bias it
+        should have been flagging. DTFM-035's model selection is the tool for
+        that; this docstring is the warning until then.
+
+    Inversion is by pseudo-inverse with an explicit cutoff rather than
+    ``np.linalg.inv``. §5.2's degeneracies make ``JᵀJ`` nearly singular in the
+    regimes this project is written about, and a plain inverse there returns
+    enormous finite numbers with no indication that anything happened. The
+    cutoff at least makes the rank deficiency explicit — and
+    :attr:`FitResult.condition_number` reports what was inverted.
+    """
+    jacobian = np.atleast_2d(np.asarray(jacobian, dtype=float))
+    residual = np.asarray(residual, dtype=float)
+    points, parameters = jacobian.shape
+
+    if sigma is None:
+        degrees_of_freedom = max(points - parameters, 1)
+        sigma = float(np.sqrt(np.sum(residual**2) / degrees_of_freedom))
+
+    normal = jacobian.T @ jacobian
+    return float(sigma) ** 2 * np.linalg.pinv(normal, rcond=rcond), float(sigma)
+
+
 def fit_least_squares(
     observed: NDArray,
     wavelengths_nm: NDArray,
@@ -130,6 +244,7 @@ def fit_least_squares(
     prior: gen.Prior | None = None,
     truth: NDArray | None = None,
     max_iterations: int = 200,
+    sigma: float | None = None,
 ) -> FitResult:
     """Recover ``θ = (d, A, B)`` from one measured spectrum, by §6's method.
 
@@ -167,6 +282,12 @@ def fit_least_squares(
     )
     elapsed = time.perf_counter() - started
 
+    covariance, noise = covariance_from_jacobian(
+        model_jacobian(solution.x, wavelengths_nm, measurement, substrate),
+        solution.fun,
+        sigma=sigma,
+    )
+
     return FitResult(
         parameters=np.asarray(solution.x, dtype=float),
         truth=None if truth is None else np.asarray(truth, dtype=float),
@@ -178,6 +299,8 @@ def fit_least_squares(
         residual_rms=float(np.sqrt(np.mean(solution.fun**2))),
         message=str(solution.message),
         initial=start,
+        covariance=covariance,
+        noise_sigma=noise,
     )
 
 
@@ -217,6 +340,7 @@ def fit_autograd(
     learning_rate: float | None = None,
     learning_rate_decay: float = 0.999,
     tolerance: float = 1e-14,
+    sigma: float | None = None,
 ) -> FitResult:
     """Recover ``θ = (d, A, B)`` by descending through the simulator itself.
 
@@ -332,6 +456,12 @@ def fit_autograd(
             measurement.observable,
         ).numpy()
 
+    covariance, noise = covariance_from_jacobian(
+        model_jacobian(parameters.numpy(), wavelengths_nm, measurement, substrate),
+        final,
+        sigma=sigma,
+    )
+
     return FitResult(
         parameters=parameters.numpy(),
         truth=None if truth is None else np.asarray(truth, dtype=float),
@@ -347,6 +477,8 @@ def fit_autograd(
             else f"{optimiser}: stopped at the iteration limit ({max_iterations})"
         ),
         initial=start,
+        covariance=covariance,
+        noise_sigma=noise,
     )
 
 
@@ -383,6 +515,36 @@ class MultiStartResult:
     @property
     def thickness_error_nm(self) -> float | None:
         return self.best.thickness_error_nm
+
+    @property
+    def covariance(self) -> NDArray[np.float64] | None:
+        return self.best.covariance
+
+    @property
+    def standard_errors(self) -> NDArray[np.float64] | None:
+        """The winner's error bar — with the same locality caveat, sharpened.
+
+        Multi-start is the one place in this project that *knows* the rival
+        minima exist, because it visited them. The covariance still describes only
+        the basin it settled in, so a fit can carry a 0.006 nm error bar while
+        another minimum sits 583 nm away with a cost 1e26 higher. Both numbers are
+        correct and they answer different questions: the error bar says how
+        precisely the data pins the answer *given* the basin, and
+        :attr:`costs` says how sure the basin choice was.
+        """
+        return self.best.standard_errors
+
+    @property
+    def thickness_sigma_nm(self) -> float | None:
+        return self.best.thickness_sigma_nm
+
+    @property
+    def correlation(self) -> NDArray[np.float64] | None:
+        return self.best.correlation
+
+    @property
+    def condition_number(self) -> float | None:
+        return self.best.condition_number
 
     @property
     def costs(self) -> NDArray[np.float64]:

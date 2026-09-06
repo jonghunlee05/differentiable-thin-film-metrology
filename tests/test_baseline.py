@@ -858,3 +858,307 @@ def test_picking_the_deepest_basin_survives_realistic_noise(substrate):
     assert errors[1e-3] < 0.1, "at realistic noise the right basin is still chosen"
     assert errors[1e-2] < 2.0, "and it degrades gracefully rather than jumping basins"
     assert errors[1e-2] > errors[1e-3], "error grows with noise, as it must"
+
+
+# --- DTFM-033: the error bar §15 calls non-negotiable -------------------------
+
+
+def test_no_fit_is_returned_without_an_error_bar(substrate):
+    """DTFM-033's acceptance criterion, and §15's blunt one.
+
+    "Never report a fit without an error bar. In this field that is a
+    disqualifying instinct rather than an oversight."
+
+    So it is not an opt-in argument. Every path that produces a
+    :class:`bl.FitResult` produces the covariance with it, and multi-start
+    forwards the winner's.
+    """
+    measurement = gen.Measurement()
+    observed = _observe(TRUTH, measurement, substrate)
+    start = [415.0, 1.46, 0.004]
+
+    results = [
+        bl.fit_least_squares(observed, WAVELENGTHS, start, measurement=measurement),
+        bl.fit_autograd(observed, WAVELENGTHS, start, measurement=measurement),
+        bl.fit_multi_start(observed, WAVELENGTHS, count=6, measurement=measurement),
+    ]
+
+    for result in results:
+        assert result.covariance is not None
+        assert result.covariance.shape == (3, 3)
+        assert result.standard_errors is not None
+        assert np.all(result.standard_errors > 0)
+        assert np.all(np.isfinite(result.standard_errors))
+        assert result.thickness_sigma_nm > 0
+        assert result.correlation is not None
+        assert result.condition_number is not None
+
+
+def test_the_jacobian_is_the_exact_one(substrate):
+    """§5.3's ``J[i,k] = ∂f(λ_i)/∂θ_k``, taken from autograd rather than differences.
+
+    ``scipy`` returns its own approximate ``jac`` at the solution and using it
+    would have been less code. It is built from a differencing step, so the error
+    bar would carry an arbitrary constant chosen by the optimiser's internals.
+    DTFM-031 established the model can hand over the exact derivative.
+    """
+    measurement = gen.Measurement()
+    theta = np.array([420.0, 1.46, 0.004])
+    jacobian = bl.model_jacobian(theta, WAVELENGTHS, measurement, substrate)
+
+    assert jacobian.shape == (2 * WAVELENGTHS.size, 3)
+
+    steps = np.array([1e-5, 1e-8, 1e-10])
+    for k, step in enumerate(steps):
+        shift = np.zeros(3)
+        shift[k] = step
+        with torch.no_grad():
+            ahead = bl.forward_observable(
+                theta + shift, WAVELENGTHS, measurement, substrate
+            ).numpy()
+            behind = bl.forward_observable(
+                theta - shift, WAVELENGTHS, measurement, substrate
+            ).numpy()
+        numeric = (ahead - behind) / (2 * step)
+        assert np.allclose(jacobian[:, k], numeric, rtol=1e-4, atol=1e-8), k
+
+
+def test_the_error_bar_scales_with_the_noise_it_was_given(substrate):
+    """``C = σ²(JᵀJ)⁻¹`` — so σ_θ is linear in σ, exactly.
+
+    Trivial arithmetic, worth pinning because it is the property that makes the
+    error bar mean something physical: quote a tool's noise figure and the
+    uncertainty it implies follows, rather than being a number the optimiser
+    happened to produce.
+    """
+    measurement = gen.Measurement()
+    observed = _observe(TRUTH, measurement, substrate)
+    start = [415.0, 1.46, 0.004]
+
+    single = bl.fit_least_squares(observed, WAVELENGTHS, start, measurement=measurement, sigma=1e-3)
+    double = bl.fit_least_squares(observed, WAVELENGTHS, start, measurement=measurement, sigma=2e-3)
+
+    assert double.thickness_sigma_nm == pytest.approx(2.0 * single.thickness_sigma_nm, rel=1e-9)
+
+
+def test_more_wavelengths_buy_precision_at_the_usual_rate(substrate):
+    """σ_θ ∝ 1/√m — but only once the grid resolves the Jacobian, which is the
+    part worth writing down.
+
+    ``σ²(JᵀJ)⁻¹`` makes the rate exact for independent samples, so the law should
+    hold everywhere. It does not, at low sampling. Measured over 400-800 nm with
+    ``σ√m`` constant if the law holds:
+
+    | points | σ_d (nm) | σ√m |
+    |---|---|---|
+    | 50 | 0.0144 | 0.102 |
+    | 100 | 0.0054 | 0.054 |
+    | 200 | 0.0057 | 0.080 |
+    | 400 | 0.0022 | 0.044 |
+    | 800 | 0.0017 | 0.048 |
+    | 3200 | 0.0008 | 0.046 |
+
+    Note 100 → 200: **more wavelengths made the predicted precision worse.** That
+    cannot happen under the law. ``JᵀJ`` is a Riemann sum over a Jacobian that
+    oscillates across the band, and at coarse sampling the sum's error oscillates
+    with the grid rather than shrinking with it. Past a few hundred points it
+    settles and the rate is clean — 800 → 3200 gives 2.07 against a predicted 2.
+
+    Checked and *not* the tabulated substrate being re-interpolated onto each
+    grid: replacing Si with a constant index leaves the same wobble.
+
+    The practical reading is that a denser spectrometer buys the boring
+    statistical rate, so the interesting levers are elsewhere — which is what
+    DTFM-028 found by changing the *observable* and getting a factor of 111.
+    """
+    measurement = gen.Measurement()
+    sigmas = {}
+    for count in (800, 3200):
+        grid = np.linspace(400.0, 800.0, count)
+        n, k = dp.load_nk("Si", grid)
+        local = torch.tensor(n + 1j * k)
+        jacobian = bl.model_jacobian(TRUTH, grid, measurement, local)
+        covariance, _ = bl.covariance_from_jacobian(
+            jacobian, np.zeros(jacobian.shape[0]), sigma=1e-3
+        )
+        sigmas[count] = float(np.sqrt(covariance[0, 0]))
+
+    assert sigmas[800] / sigmas[3200] == pytest.approx(2.0, rel=0.1)
+
+
+def test_the_estimated_noise_recovers_the_noise_that_was_added(substrate):
+    """When the instrument figure is unknown, ``s² = RSS/(m−n)`` stands in.
+
+    It is only trustworthy while the model can represent the data. A systematic
+    the model cannot fit inflates the residual, ``s`` absorbs it, and the error
+    bar grows to *cover* a bias it should have been reporting — which is why
+    DTFM-035's model selection exists and why ``sigma`` can be supplied instead.
+    """
+    measurement = gen.Measurement()
+    rng = np.random.default_rng(3)
+    added = 2e-3
+    observed = _observe(TRUTH, measurement, substrate)
+    noisy = observed + rng.normal(0.0, added, observed.shape)
+
+    result = bl.fit_least_squares(noisy, WAVELENGTHS, [415.0, 1.46, 0.004], measurement=measurement)
+
+    assert result.noise_sigma == pytest.approx(added, rel=0.15)
+
+
+def test_a_wrong_fringe_fit_reports_a_confident_error_bar(substrate):
+    """The limitation, stated as a test rather than as a caveat.
+
+    The covariance is the curvature of the cost at the point the fit stopped, so
+    it describes the width of *that* basin. It knows nothing about a rival 583 nm
+    away. A cold-started fit therefore reports a small, tight error bar around a
+    badly wrong answer — and it is right to, because the question it answers is
+    "how precisely does the data pin the answer given this basin".
+
+    What exposes the error is the residual, which is orders of magnitude larger.
+    §10's thesis is that the classical method fails loudly; this test locates
+    exactly *where* the loudness lives, and it is not in the error bar. Anyone
+    quoting σ without also quoting the residual has the wrong instinct.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([900.0, 1.46, 0.004])
+    observed = _observe(truth, measurement, substrate)
+
+    good = bl.fit_least_squares(
+        observed,
+        WAVELENGTHS,
+        [890.0, 1.46, 0.004],
+        measurement=measurement,
+        truth=truth,
+        sigma=1e-3,
+    )
+    wrong = bl.fit_least_squares(
+        observed,
+        WAVELENGTHS,
+        [300.0, 1.47, 0.005],
+        measurement=measurement,
+        truth=truth,
+        sigma=1e-3,
+    )
+
+    assert abs(wrong.thickness_error_nm) > 100.0, "badly wrong"
+    assert wrong.thickness_sigma_nm < 10.0, "and quietly confident about it"
+    assert abs(wrong.thickness_error_nm) > 10.0 * wrong.thickness_sigma_nm, (
+        "the error bar does not cover the error"
+    )
+    assert wrong.residual_rms > 100.0 * good.residual_rms, (
+        "the residual is what gives it away, not the covariance"
+    )
+
+
+def test_the_error_bar_matches_the_observed_scatter(substrate):
+    """The test that decides whether any of this means anything.
+
+    ``C = σ²(JᵀJ)⁻¹`` is a linearisation. It is only an error bar if refitting
+    noisy repeats actually scatters by that much. Measured over 200 repeats per
+    film at an ellipsometer σ of 1e-3 rad:
+
+    | film | predicted σ_d | observed σ_d | ratio |
+    |---|---|---|---|
+    | 65 nm | 0.01136 | 0.01110 | 0.98 |
+    | 150 nm | 0.00069 | 0.00064 | 0.93 |
+    | 420 nm | 0.00569 | 0.00551 | 0.97 |
+    | 900 nm | 0.02490 | 0.02668 | 1.07 |
+    | 1500 nm | 0.02486 | 0.02455 | 0.99 |
+
+    Agreement to within 7% across a 23-fold range of thickness. The Gaussian
+    approximation is doing its job here, which is a statement about *this*
+    measurement being well-conditioned near the truth — not a general licence.
+    The same number is meaningless once the fit is in the wrong basin, which
+    ``test_a_wrong_fringe_fit_reports_a_confident_error_bar`` shows.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([420.0, 1.46, 0.004])
+    sigma = 1e-3
+    clean = _observe(truth, measurement, substrate)
+    rng = np.random.default_rng(1)
+
+    predicted = bl.fit_least_squares(
+        clean, WAVELENGTHS, truth, measurement=measurement, sigma=sigma
+    ).thickness_sigma_nm
+    recovered = [
+        bl.fit_least_squares(
+            clean + rng.normal(0.0, sigma, clean.shape),
+            WAVELENGTHS,
+            truth,
+            measurement=measurement,
+            sigma=sigma,
+        ).parameters[0]
+        for _ in range(80)
+    ]
+    observed = float(np.std(recovered, ddof=1))
+
+    assert observed / predicted == pytest.approx(1.0, abs=0.3)
+
+
+@pytest.mark.parametrize(
+    ("thickness", "floor", "ceiling"),
+    [(150.0, 0.0, 0.4), (900.0, 0.95, 1.0), (1500.0, 0.95, 1.0)],
+)
+def test_thickness_and_index_correlate_more_as_the_film_thickens(
+    thickness, floor, ceiling, substrate
+):
+    """§5.3's ρ, and a correction to what the spec predicts about it.
+
+    §5.3: "ρ between thickness and index will frequently exceed 0.99. Reporting
+    that alongside the fitted value is what separates a metrologist from someone
+    who called ``curve_fit``."
+
+    True for thick films, and false for thin ones. Measured at σ = 1e-3:
+
+    | film | ρ(d, A) | condition number |
+    |---|---|---|
+    | 65 nm | −0.599 | 4.7e5 |
+    | **150 nm** | **−0.086** | 1.1e6 |
+    | 420 nm | −0.746 | 9.0e8 |
+    | 900 nm | −0.987 | 9.4e9 |
+    | 1500 nm | −0.996 | 8.2e10 |
+
+    The near-zero at 150 nm is the anomaly ``Implementation-Notes.md`` parked as
+    an open question under DTFM-026, now reproduced with tooling built for it
+    rather than an ad-hoc script. There is a thickness where ``d`` and ``n``
+    become almost independently determined, and it sits in the range this project
+    is written about. DTFM-034 locates it properly; what this test fixes is that
+    the effect is real and not an artefact of the earlier script.
+    """
+    measurement = gen.Measurement()
+    truth = np.array([thickness, 1.46, 0.004])
+    result = bl.fit_least_squares(
+        _observe(truth, measurement, substrate),
+        WAVELENGTHS,
+        truth,
+        measurement=measurement,
+        sigma=1e-3,
+    )
+
+    assert floor <= abs(float(result.correlation[0, 1])) <= ceiling
+
+
+def test_the_condition_number_grows_with_thickness(substrate):
+    """Why the inverse is a pseudo-inverse with an explicit cutoff.
+
+    ``JᵀJ`` runs from 1e5 to 1e11 over the prior's range. At the top of that,
+    ``np.linalg.inv`` returns large finite numbers with nothing raised, and the
+    resulting error bar looks like a measurement rather than like numerical
+    noise. §5.2's degeneracies are the reason, and this is where they show up
+    first — before they show up in a wrong answer.
+    """
+    measurement = gen.Measurement()
+    conditions = []
+    for thickness in (65.0, 900.0, 1500.0):
+        truth = np.array([thickness, 1.46, 0.004])
+        result = bl.fit_least_squares(
+            _observe(truth, measurement, substrate),
+            WAVELENGTHS,
+            truth,
+            measurement=measurement,
+            sigma=1e-3,
+        )
+        conditions.append(result.condition_number)
+
+    assert conditions[0] < conditions[1] < conditions[2]
+    assert conditions[-1] > 1e9, "and the thick end is genuinely ill-conditioned"
