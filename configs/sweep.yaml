@@ -1,0 +1,22 @@
+# A sweep: every field under `sweep` is expanded as a Cartesian product, and
+# everything else is inherited. This file is 4 MLP runs and 4 CNN runs.
+#
+#   python scripts/train.py --config configs/sweep.yaml --sweep     # locally
+#   gh workflow run sweep.yml                                       # on GitHub
+#
+# Run it on GitHub rather than a laptop. A CNN run pegs every core for 25 minutes;
+# a sweep runs for hours, and a throttling laptop makes LATER runs slower than
+# earlier ones, which corrupts any timing comparison. GitHub's matrix runs all
+# eight in parallel on separate machines — about 25 minutes wall clock instead of
+# two and a half hours, and none of it on your hardware.
+
+depth: 3
+steps: 8000
+batch: 256
+lr: 1.0e-3
+seed: 0
+
+sweep:
+  architecture: [mlp, cnn]
+  width: [128, 256]        # mlp only; ignored by cnn runs
+  channels: [16, 32]       # cnn only; ignored by mlp runs

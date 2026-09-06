@@ -1,0 +1,22 @@
+# One training run. Spec §15: the run that produces a reported number must be
+# reproducible from its config, so everything that affects the result is here and
+# nothing is left on a command line.
+#
+#   python scripts/train.py --config configs/train.yaml
+#
+# Defaults below are DTFM-040's winner: the CNN beat the MLP by 20% with half the
+# parameters, and by 42% on thin films specifically.
+
+architecture: cnn         # 'mlp' or 'cnn'
+depth: 3
+channels: 32              # cnn only
+kernel: 7                 # cnn only, must be odd
+width: 256                # mlp only
+output_margin: 0.0        # DTFM-039 measured 0.2 as worse; see Implementation-Notes §28
+
+steps: 8000
+batch: 256
+lr: 1.0e-3
+seed: 0
+checkpoint_every: 1000
+label: ""
