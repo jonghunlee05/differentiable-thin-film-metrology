@@ -1,0 +1,27 @@
+# The cheapest run that exercises the whole path. 300 steps, one MLP, ~30 seconds
+# of training on a hosted runner.
+#
+#   gh workflow run sweep.yml -f config=configs/smoke.yaml -f runs=1
+#
+# Purpose is the PLUMBING, not the physics: that the torch install resolves, that
+# the plan job turns a config into a matrix, that a run directory survives as an
+# artifact, and that `collect_runs.py` merges it back. A 300-step network is bad
+# on purpose — expect roughly 20 nm median against 5.977 nm at 8000 steps. Its
+# `label` marks it so it can be told from a real result and dropped from the
+# tuning record.
+#
+# Use this before a long sweep only when the workflow itself has changed. A normal
+# sweep does not need it: the install and the plan job run in the first ninety
+# seconds either way, so a real run finds the same breakages just as fast.
+
+architecture: mlp
+depth: 3
+width: 256
+output_margin: 0.0
+
+steps: 300
+batch: 256
+lr: 1.0e-3
+seed: 0
+checkpoint_every: 100
+label: smoke
