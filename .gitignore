@@ -27,3 +27,6 @@ data/*
 .ruff_cache/
 build/
 dist/
+
+# Training run history — generated output, per §15
+runs/
