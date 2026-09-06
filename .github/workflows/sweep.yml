@@ -47,14 +47,21 @@ jobs:
       - run: pip install -e .
       - id: build
         run: |
-          python scripts/train.py --config "${{ inputs.config }}" --list
-          total=$(python scripts/train.py --config "${{ inputs.config }}" --list | wc -l)
+          python scripts/train.py --config "${{ inputs.config }}" --list | tee plan.txt
+          total=$(wc -l < plan.txt)
           want=${{ inputs.runs }}
           if [ "$want" -gt "$total" ]; then
-            echo "asked for $want runs, config describes $total" >&2
+            echo "asked for $want runs, but ${{ inputs.config }} describes $total." >&2
+            echo "Sweep entries that differ only in a field their architecture ignores" >&2
+            echo "are deduplicated, so a config can describe fewer runs than it looks." >&2
             exit 1
           fi
-          echo "indices=$(seq 0 $((want - 1)) | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          # `python`, not `jq`: the interpreter is already installed and pinned by
+          # this job, so this line can be checked locally. jq is only preinstalled
+          # by convention, and a line that cannot be run off CI is a line that
+          # first runs in anger.
+          indices=$(python -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$want")
+          echo "indices=$indices" >> "$GITHUB_OUTPUT"
 
   train:
     needs: plan
