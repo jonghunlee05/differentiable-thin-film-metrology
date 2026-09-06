@@ -1,0 +1,56 @@
+# The architecture sweep — DTFM-070, spec §7.2.
+#
+#   python scripts/train.py --config configs/sweep_architecture.yaml --list
+#   gh workflow run sweep.yml --ref DTFM-070-architecture-sweep \
+#       -f config=configs/sweep_architecture.yaml -f runs=108
+#
+# 108 unique runs. Roughly 5.8 hours of wall clock on 20 parallel machines and
+# 115 machine-hours in total, which is free on a public repository. The longest
+# single job is about 4.5 hours — under the 6-hour per-job cap, with margin.
+#
+# THREE QUESTIONS, one per swept axis.
+#
+# `steps` is the important one, and it is here because DTFM-039 and DTFM-040 were
+# both measured before they had finished learning. Their loss was still falling by
+# 38-44% over the final fifth of training. Comparing architectures at that point
+# does not measure which is better; it measures which learns fastest early, and
+# those differ — a larger model typically starts slower and ends better. Every
+# conclusion drawn from 8000-step runs is provisional until this is settled, so
+# the ladder 8k -> 24k -> 48k is swept rather than assumed.
+#
+# `seed` buys error bars. One config on two machines differed by 4.9% (Notes §29),
+# and without a spread there is no way to tell a real gap from that noise. Three
+# seeds per configuration is the cheapest number that gives a spread at all. Read
+# the results as 36 configurations with error bars, never as a leaderboard of 108:
+# taking the best of 108 noisy draws selects for luck, and that number will not
+# reproduce.
+#
+# `width` / `channels` / `depth` ask whether DTFM-040's finding survives scale. The
+# CNN beat the MLP by 20% with half the parameters, and the whole gain was in thin
+# films. Both models are swept across a comparable size range so the comparison is
+# not confounded by one being larger.
+#
+# HELD FIXED, deliberately: kernel 7, batch 256, lr 1e-3, MSE loss, margin 0.
+# Varying the optimiser and the architecture together would make neither
+# attributable. Kernel is a real knob and is deliberately deferred — sweeping it
+# on top of runs that had not converged would measure a second-order effect on top
+# of a first-order error.
+#
+# ONE STANDING CAVEAT. All of this is measured under MSE, and DTFM-042 replaces
+# that loss with Gaussian NLL plus a reconstruction term. The trunk architecture
+# is likely to transfer and the head certainly will not. Whether the ranking holds
+# is a bet, and it is cheap to re-check afterwards rather than assume.
+
+kernel: 7
+batch: 256
+lr: 1.0e-3
+output_margin: 0.0
+checkpoint_every: 2000
+
+sweep:
+  architecture: [mlp, cnn]
+  width: [128, 256, 512]     # mlp only; ignored by cnn runs
+  channels: [16, 32, 64]     # cnn only; ignored by mlp runs
+  depth: [2, 3]
+  steps: [8000, 24000, 48000]
+  seed: [0, 1, 2]
