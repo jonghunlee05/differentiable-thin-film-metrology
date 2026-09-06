@@ -44,7 +44,7 @@ from torch import nn
 
 from src import generate as gen
 
-__all__ = ["InverseMLP", "ParameterScaler", "SpectrumScaler", "build_model"]
+__all__ = ["InverseCNN", "InverseMLP", "ParameterScaler", "SpectrumScaler", "build_model"]
 
 
 @dataclass
@@ -187,6 +187,87 @@ class InverseMLP(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class InverseCNN(nn.Module):
+    """§7.2's second architecture: a 1D convolution over the spectrum.
+
+    §7.2 calls this "better suited — fringes are local repeating structure", and
+    the claim is about **inductive bias**. :class:`InverseMLP` receives the 400
+    inputs as an unordered vector and has to *learn* that wavelength 51 sits
+    beside wavelength 52; a convolution is told. It slides a small detector along
+    the spectrum and finds a fringe pattern wherever it occurs, spending capacity
+    on the shape rather than on the layout.
+
+    The reshape is the load-bearing decision
+    ----------------------------------------
+    The 400 inputs are **200 wavelengths × 2 channels**, not a flat run of 400.
+    ``Ψ[i]`` and ``Δ[i]`` are the *same wavelength* — they belong at the same
+    position in different channels, exactly as red and green are one pixel.
+
+    Laying them out as ``1 × 400`` would let the kernel straddle the boundary at
+    index 200, mixing the phase near 800 nm with the amplitude near 400 nm. That
+    is physically meaningless, and it would train perfectly happily while doing
+    it — the model would simply be worse, with nothing to say why.
+
+    Downsampling halves the length per block, so a fixed kernel covers a wider
+    span of wavelength each time: fine fringe structure first, the broad envelope
+    later. That progression is the reason to stack blocks rather than widen one.
+    """
+
+    def __init__(
+        self,
+        input_size: int = 400,
+        channels: int = 32,
+        depth: int = 3,
+        kernel: int = 7,
+        width: int = 128,
+        *,
+        uncertainty: bool = False,
+        prior: gen.Prior | None = None,
+        observable: str = "ellipsometry",
+        output_margin: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if depth < 1 or channels < 1 or width < 1:
+            raise ValueError("channels, depth and width must all be at least 1")
+        if kernel % 2 == 0:
+            raise ValueError(f"kernel must be odd so padding is symmetric, got {kernel}")
+
+        self.scale_x = SpectrumScaler(observable)
+        self.scale_theta = ParameterScaler(prior or gen.Prior(), margin=output_margin)
+        self.uncertainty = uncertainty
+        self.observable = observable
+        self.channels_in = 2 if observable == "ellipsometry" else 1
+
+        blocks: list[nn.Module] = []
+        in_channels, length = self.channels_in, input_size // self.channels_in
+        for _ in range(depth):
+            blocks += [
+                nn.Conv1d(in_channels, channels, kernel, padding=kernel // 2),
+                nn.ReLU(),
+                nn.MaxPool1d(2),
+            ]
+            in_channels, length = channels, length // 2
+        self.trunk = nn.Sequential(*blocks)
+        self.flat = in_channels * length
+        self.dense = nn.Sequential(nn.Linear(self.flat, width), nn.ReLU())
+        self.head_theta = nn.Linear(width, 3)
+        self.head_log_var = nn.Linear(width, 3) if uncertainty else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        scaled = self.scale_x(x)
+        # (batch, 400) -> (batch, 2, 200): Psi and Delta as channels of one grid
+        stacked = scaled.reshape(scaled.shape[0], self.channels_in, -1)
+        features = self.dense(self.trunk(stacked).flatten(1))
+        theta = self.scale_theta.decode(torch.sigmoid(self.head_theta(features)))
+        if self.head_log_var is None:
+            return theta
+        return theta, self.head_log_var(features)
+
+    @property
+    def parameter_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
 def build_model(config: dict | None = None, **overrides):
     """Build a model from a config dictionary — §7.2's AC.
 
@@ -208,6 +289,13 @@ def build_model(config: dict | None = None, **overrides):
 
     architecture = settings.pop("architecture")
     prior = settings.pop("prior", None)
-    if architecture != "mlp":
-        raise ValueError(f"unknown architecture {architecture!r}; only 'mlp' exists until DTFM-040")
-    return InverseMLP(prior=prior, **settings)
+    if architecture == "mlp":
+        settings.pop("channels", None)
+        settings.pop("kernel", None)
+        return InverseMLP(prior=prior, **settings)
+    if architecture == "cnn":
+        settings.setdefault("channels", 32)
+        settings.setdefault("kernel", 7)
+        settings["width"] = settings.get("width", 128)
+        return InverseCNN(prior=prior, **settings)
+    raise ValueError(f"unknown architecture {architecture!r}; expected 'mlp' or 'cnn'")
