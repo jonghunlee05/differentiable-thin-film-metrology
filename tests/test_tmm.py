@@ -523,9 +523,7 @@ def test_reflectance_is_periodic_in_optical_thickness(pol):
     for d in (40.0, 137.0, 260.0):
         base = pt.stack_reflectance(WAVELENGTH, [d], [1.0, n, 3.88], theta, pol)
         for k in (1, 2, 5):
-            shifted = pt.stack_reflectance(
-                WAVELENGTH, [d + k * period], [1.0, n, 3.88], theta, pol
-            )
+            shifted = pt.stack_reflectance(WAVELENGTH, [d + k * period], [1.0, n, 3.88], theta, pol)
             assert torch.allclose(base, shifted, atol=1e-10)
 
 
@@ -623,10 +621,12 @@ def test_batched_spectra_match_a_loop_over_single_calls():
     for pol in POLARISATIONS:
         for angle in (0.0, 0.7):
             batched = pt.spectra(wavelengths, thicknesses, indices, angle, pol)
-            looped = torch.stack([
-                pt.stack_reflectance(wavelengths, [row[0], row[1]], indices, angle, pol)
-                for row in thicknesses
-            ])
+            looped = torch.stack(
+                [
+                    pt.stack_reflectance(wavelengths, [row[0], row[1]], indices, angle, pol)
+                    for row in thicknesses
+                ]
+            )
             assert batched.shape == (thicknesses.shape[0], wavelengths.numel())
             assert torch.allclose(batched, looped, atol=1e-14)
 
@@ -638,9 +638,9 @@ def test_batching_handles_a_dispersive_index():
     thicknesses = torch.tensor([[120.0], [340.0]])
 
     batched = pt.spectra(wavelengths, thicknesses, [1.0, n_film, 3.88])
-    looped = torch.stack([
-        pt.stack_reflectance(wavelengths, [row[0]], [1.0, n_film, 3.88]) for row in thicknesses
-    ])
+    looped = torch.stack(
+        [pt.stack_reflectance(wavelengths, [row[0]], [1.0, n_film, 3.88]) for row in thicknesses]
+    )
 
     assert torch.allclose(batched, looped, atol=1e-14)
 
@@ -671,8 +671,7 @@ def test_batched_gradients_match_per_sample_gradients():
     enough that gradients are finite: each row's gradient must equal what that
     film would have got alone, or the batch axis is leaking between samples.
     """
-    thicknesses = torch.tensor([[120.0], [340.0], [55.0]], dtype=torch.float64,
-                               requires_grad=True)
+    thicknesses = torch.tensor([[120.0], [340.0], [55.0]], dtype=torch.float64, requires_grad=True)
     pt.spectra(SPECTRUM, thicknesses, [1.0, 1.46, 3.88]).sum().backward()
 
     for i, d in enumerate([120.0, 340.0, 55.0]):
@@ -950,9 +949,7 @@ def test_the_null_degrades_away_from_normal_incidence(n_sub):
     assert all(b > a for a, b in zip(values, values[1:], strict=False))
     assert values[0] < 1e-20
     # still far better than no coating at all, even well off-axis
-    bare = pt.stack_reflectance(
-        torch.tensor(DESIGN_WAVELENGTH), [], [1.0, n_sub], 0.9, "s"
-    ).item()
+    bare = pt.stack_reflectance(torch.tensor(DESIGN_WAVELENGTH), [], [1.0, n_sub], 0.9, "s").item()
     assert values[-1] < bare
 
 
@@ -974,8 +971,11 @@ REFERENCE_STACKS = [
     ("weakly absorbing film", [300.0], [1.0, 1.5 + 0.05j, 3.88]),
     ("strongly absorbing stack", [80.0, 40.0, 200.0], [1.0, 1.5 + 0.05j, 2.3, 4.0 + 1.5j, 3.88]),
     ("metal-like layer", [30.0, 300.0], [1.0, 0.15 + 3.5j, 1.46, 1.0]),
-    ("six alternating layers", [80.0, 100.0, 80.0, 100.0, 80.0, 100.0],
-     [1.0, 1.46, 2.3, 1.46, 2.3, 1.46, 2.3, 3.88]),
+    (
+        "six alternating layers",
+        [80.0, 100.0, 80.0, 100.0, 80.0, 100.0],
+        [1.0, 1.46, 2.3, 1.46, 2.3, 1.46, 2.3, 3.88],
+    ),
 ]
 
 REFERENCE_ANGLES = [0.0, 0.3, 0.6, 1.0]
@@ -996,10 +996,9 @@ def test_reflectance_matches_the_reference_package(name, thicknesses, indices, t
     got = pt.stack_reflectance(
         torch.tensor(REFERENCE_SPECTRUM), thicknesses, indices, theta_0, pol
     ).numpy()
-    expected = np.array([
-        abs(_reference_r(pol, indices, thicknesses, theta_0, w)) ** 2
-        for w in REFERENCE_SPECTRUM
-    ])
+    expected = np.array(
+        [abs(_reference_r(pol, indices, thicknesses, theta_0, w)) ** 2 for w in REFERENCE_SPECTRUM]
+    )
 
     assert np.allclose(got, expected, rtol=0, atol=1e-13), name
 
@@ -1015,12 +1014,10 @@ def test_complex_amplitude_matches_the_reference_package(name, thicknesses, indi
     loss, §5.3's Jacobian and any future ellipsometry (§3, Ψ and Δ are defined
     from r_p/r_s) all depend on the amplitude, not the intensity.
     """
-    got = pt.stack_r(
-        torch.tensor(REFERENCE_SPECTRUM), thicknesses, indices, theta_0, pol
-    ).numpy()
-    expected = np.array([
-        _reference_r(pol, indices, thicknesses, theta_0, w) for w in REFERENCE_SPECTRUM
-    ])
+    got = pt.stack_r(torch.tensor(REFERENCE_SPECTRUM), thicknesses, indices, theta_0, pol).numpy()
+    expected = np.array(
+        [_reference_r(pol, indices, thicknesses, theta_0, w) for w in REFERENCE_SPECTRUM]
+    )
 
     assert np.allclose(got, expected, rtol=0, atol=1e-13), name
 
@@ -1089,12 +1086,8 @@ CONSERVATION_SPECTRUM = torch.linspace(400.0, 900.0, 120, dtype=torch.float64)
 @pytest.mark.parametrize(("name", "thicknesses", "indices"), CONSERVING_STACKS)
 def test_transparent_stacks_conserve_energy_exactly(name, thicknesses, indices, theta_0, pol):
     """R + T = 1 with no absorption. An equality, so nothing can hide in it."""
-    reflected = pt.stack_reflectance(
-        CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol
-    )
-    transmitted = pt.stack_transmittance(
-        CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol
-    )
+    reflected = pt.stack_reflectance(CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol)
+    transmitted = pt.stack_transmittance(CONSERVATION_SPECTRUM, thicknesses, indices, theta_0, pol)
 
     assert torch.allclose(reflected + transmitted, torch.ones_like(reflected), atol=1e-13), name
 
@@ -1298,9 +1291,9 @@ def test_a_very_thick_film_averages_to_the_incoherent_result():
     wavelengths = torch.linspace(549.0, 551.0, 20001, dtype=torch.float64)
     errors = []
     for thickness in (2_000.0, 20_000.0, 200_000.0):
-        averaged = pt.stack_reflectance(
-            wavelengths, [thickness], [n_0, n_1, n_2], 0.0, "s"
-        ).mean().item()
+        averaged = (
+            pt.stack_reflectance(wavelengths, [thickness], [n_0, n_1, n_2], 0.0, "s").mean().item()
+        )
         errors.append(abs(averaged - incoherent))
 
     assert errors[-1] < 1e-3
@@ -1369,8 +1362,10 @@ def test_an_absorbing_substrate_makes_the_thin_film_easier_to_see():
     def slope(substrate) -> float:
         bare = pt.stack_reflectance(wavelength, [], [1.0, substrate], 0.0, "s").item()
         values = [
-            abs(pt.stack_reflectance(wavelength, [d], [1.0, 1.46, substrate], 0.0, "s").item()
-                - bare)
+            abs(
+                pt.stack_reflectance(wavelength, [d], [1.0, 1.46, substrate], 0.0, "s").item()
+                - bare
+            )
             for d in (1.0, 0.1, 0.01)
         ]
         return float(np.log10(np.mean([values[0] / values[1], values[1] / values[2]])))
@@ -1563,9 +1558,7 @@ def test_delta_uses_the_full_circle():
     that distinguishes a film above its quarter-wave point from one below it.
     """
     wavelengths = torch.linspace(400.0, 800.0, 400, dtype=torch.float64)
-    _, delta = pt.stack_psi_delta(
-        wavelengths, [900.0], [1.0, 1.46, 3.88], np.radians(70.0)
-    )
+    _, delta = pt.stack_psi_delta(wavelengths, [900.0], [1.0, 1.46, 3.88], np.radians(70.0))
 
     assert delta.min().item() < -0.5
     assert delta.max().item() > 0.5
@@ -1576,9 +1569,7 @@ def test_ellipsometry_is_differentiable():
     thickness = torch.tensor(300.0, dtype=torch.float64, requires_grad=True)
     wavelengths = torch.linspace(400.0, 800.0, 60, dtype=torch.float64)
 
-    psi, delta = pt.stack_psi_delta(
-        wavelengths, [thickness], [1.0, 1.46, 3.88], np.radians(70.0)
-    )
+    psi, delta = pt.stack_psi_delta(wavelengths, [thickness], [1.0, 1.46, 3.88], np.radians(70.0))
     (psi.sum() + delta.sum()).backward()
 
     assert torch.isfinite(thickness.grad) and thickness.grad.item() != 0.0
@@ -1592,3 +1583,241 @@ def test_the_informativeness_guard_matches_the_measured_gains():
     assert not pt.psi_delta_is_informative(np.radians(20.0))
     assert pt.psi_delta_is_informative(np.radians(30.0))
     assert pt.psi_delta_is_informative(np.radians(70.0))
+
+
+# --- DTFM-038: coverage the mutation testing found missing --------------------
+#
+# Introducing real physics bugs and counting which tests noticed gave, out of 514:
+#
+#   1 ppm error in r_s                    125 caught
+#   factor of 2 in the layer phase        113 caught
+#   flipped layer-phase sign               95 caught
+#   flipped r_p sign convention            57 caught
+#   disabled branch-cut selection           8 caught
+#   1% error in the ellipsometry ratio      2 caught   <- the observable we use
+#
+# The last two are the thin spots, and the ordering is backwards: r_s is guarded
+# by 125 tests and is not what this project measures, while Ψ/Δ is the observable
+# every reported number depends on and was guarded by two. The tests below close
+# that gap.
+
+
+def test_delta_is_180_degrees_at_normal_incidence():
+    """A closed-form anchor for Ψ and Δ, not another calculation.
+
+    At normal incidence s and p are the same physical wave described in two
+    coordinate systems that differ by a flip, so with §4.2's convention
+    ``r_p = −r_s`` exactly. That makes ``ρ = −1``, hence ``Ψ = 45°`` and
+    ``Δ = 180°`` for **any** film on any substrate at any wavelength.
+
+    Independent of thickness, index and material — which is what makes it a real
+    check rather than a regression against our own output.
+    """
+    grid = torch.linspace(400.0, 800.0, 40, dtype=torch.float64)
+    for thickness, index in ((120.0, 1.44), (900.0, 1.52), (30.0, 2.10)):
+        psi, delta = pt.stack_psi_delta(grid, [thickness], [1.0, index, 3.9 + 0.03j], 0.0)
+        assert torch.allclose(psi, torch.full_like(psi, np.pi / 4), atol=1e-12)
+        assert torch.allclose(torch.abs(delta), torch.full_like(delta, np.pi), atol=1e-12)
+
+
+def test_psi_and_delta_reconstruct_the_ratio_they_came_from():
+    """``ρ = tan(Ψ)·e^{iΔ}`` is the definition. Round-tripping it catches an
+    error in either half — a 1% scaling of ρ, which the suite previously caught
+    with two assertions, breaks this immediately.
+    """
+    grid = torch.linspace(400.0, 800.0, 60, dtype=torch.float64)
+    stack = ([420.0], [1.0, 1.46, 3.95 + 0.03j], np.radians(70.0))
+
+    rho = pt.stack_rho(grid, *stack)
+    psi, delta = pt.stack_psi_delta(grid, *stack)
+    rebuilt = torch.tan(psi) * torch.exp(1j * delta)
+
+    assert torch.allclose(rebuilt, rho, rtol=0, atol=1e-13)
+
+
+def test_psi_and_delta_come_from_the_two_polarisations():
+    """Ψ and Δ must be the amplitude ratio and phase difference of r_p and r_s,
+    computed independently through :func:`stack_r` rather than through
+    :func:`stack_rho`. If the ellipsometry path drifted from the underlying
+    Fresnel coefficients, only a check like this would notice.
+    """
+    grid = torch.linspace(400.0, 800.0, 50, dtype=torch.float64)
+    layers, media, angle = [640.0], [1.0, 1.47, 3.9 + 0.05j], np.radians(65.0)
+
+    r_s = pt.stack_r(grid, layers, media, angle, "s")
+    r_p = pt.stack_r(grid, layers, media, angle, "p")
+    psi, delta = pt.stack_psi_delta(grid, layers, media, angle)
+
+    assert torch.allclose(torch.tan(psi), torch.abs(r_p / r_s), rtol=0, atol=1e-13)
+    assert torch.allclose(
+        torch.cos(delta - torch.angle(r_p / r_s)), torch.ones_like(delta), atol=1e-13
+    )
+
+
+@pytest.mark.parametrize("thickness", [45.0, 300.0, 1500.0])
+def test_the_ellipsometric_ratio_is_sensitive_to_thickness(thickness):
+    """A 1% change in ρ was caught by two assertions before this ticket. The
+    observable has to *move* with the parameter it is supposed to determine, or
+    the whole project rests on a quantity nothing is checking.
+    """
+    grid = torch.linspace(400.0, 800.0, 80, dtype=torch.float64)
+    stack = ([1.0, 1.46, 3.95 + 0.03j], np.radians(70.0))
+
+    base = pt.stack_rho(grid, [thickness], *stack)
+    nudged = pt.stack_rho(grid, [thickness * 1.001], *stack)
+
+    moved = float(torch.max(torch.abs(nudged - base)))
+    assert moved > 1e-4, f"a 0.1% thickness change moved ρ by only {moved:.1e}"
+
+
+@pytest.mark.parametrize("angle_deg", [0.0, 30.0, 60.0, 80.0])
+def test_an_absorbing_substrate_never_reflects_more_than_arrives(angle_deg):
+    """No stack may reflect more than arrives, at any angle, on any substrate.
+
+    A general energy check across absorbing substrates. **Not** a test of the
+    branch cut, despite looking like one — see
+    ``test_the_branch_guard_is_correct_and_never_fires`` for why that distinction
+    matters.
+    """
+    grid = torch.linspace(400.0, 800.0, 40, dtype=torch.float64)
+    for substrate in (3.9 + 0.03j, 1.5 + 0.5j, 0.5 + 3.0j):
+        for polarisation in ("s", "p"):
+            reflectance = pt.stack_reflectance(
+                grid, [380.0], [1.0, 1.46, substrate], np.radians(angle_deg), polarisation
+            )
+            assert torch.all(reflectance <= 1.0 + 1e-12), (
+                f"R > 1 for {substrate} at {angle_deg}° ({polarisation}) — "
+                "the branch cut has selected a gain solution"
+            )
+            assert torch.all(reflectance >= 0.0)
+
+
+def test_a_more_absorbing_substrate_cannot_reflect_less_than_a_transparent_one():
+    """Absorption must raise reflectance, monotonically.
+
+    Adding ``k`` to a substrate raises the index contrast with the film, so at
+    normal incidence the interface reflects more. A sign error in how ``k`` enters
+    the interface coefficient inverts this ordering.
+    """
+    grid = torch.linspace(400.0, 800.0, 30, dtype=torch.float64)
+    previous = None
+    for k in (0.0, 0.5, 2.0, 5.0):
+        reflectance = pt.stack_reflectance(
+            grid, [200.0], [1.0, 1.46, 3.5 + 1j * k], 0.0, "s"
+        ).mean()
+        if previous is not None:
+            assert reflectance > previous, f"k={k} reflects less than the less-absorbing case"
+        previous = reflectance
+
+
+def test_the_branch_guard_is_correct_and_never_fires():
+    """A guard that is right and inactive, which is worth knowing precisely.
+
+    ``cos_theta_t`` ends with ``torch.where(is_forward(...), cos_j, -cos_j)`` —
+    §4.2's rule that the transmitted wave must decay rather than grow. Choosing
+    the other root describes a medium that amplifies light, and
+    ``Implementation-Notes.md`` §1 records the project's spec originally carrying
+    a *different* rule that admitted exactly that.
+
+    Measured here: across 4000 random passive media and angles, the guard flips
+    the root **zero times**. ``torch.sqrt``'s principal branch already satisfies
+    ``Im(ñ cosθ) ≥ 0`` for passive media, so the ``where`` is belt-and-braces.
+
+    Recorded as a test because it changes what other tests can claim. Deleting the
+    guard would not move a single reflectance, so no ``R ≤ 1`` check can be said
+    to "test the branch cut" — a mutation that removes it is a no-op, and a suite
+    could appear to cover it while covering nothing. See
+    ``Implementation-Notes.md`` §27.
+
+    The guard stays. It costs one ``where`` and it is the only thing standing
+    between this model and a gain solution if a future change alters how the root
+    is taken.
+    """
+    generator = np.random.default_rng(0)
+    flipped = examined = 0
+    for _ in range(500):
+        n_i = generator.uniform(1, 4) + 1j * generator.uniform(0, 3) * (generator.random() < 0.5)
+        n_j = generator.uniform(1, 4) + 1j * generator.uniform(0, 3) * (generator.random() < 0.5)
+        cos_j = pt.cos_theta_t(
+            pt.as_complex(n_i),
+            pt.as_complex(n_j),
+            torch.tensor(generator.uniform(0.0, np.pi / 2 * 0.999)),
+        )
+        examined += 1
+        flipped += not bool(pt.is_forward(pt.as_complex(n_j), cos_j).all())
+
+    assert examined == 500
+    assert flipped == 0, (
+        f"the guard fired {flipped} times — torch.sqrt's branch convention has changed, "
+        "and every claim about which tests cover the branch cut needs revisiting"
+    )
+
+
+@pytest.mark.parametrize("theta_0", [0.3, 0.6, 1.0, 1.3])
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), REFERENCE_STACKS)
+def test_psi_and_delta_match_the_reference_package(name, thicknesses, indices, theta_0):
+    """Ψ and Δ against an independently written implementation, per wavelength.
+
+    This closes the gap DTFM-038's mutation testing exposed. Before it, a 1%
+    error in the ellipsometric ratio was caught by **2** tests out of 514, while
+    a one-part-per-million error in ``r_s`` was caught by 125 — the observable
+    every reported number in this project depends on was the least-guarded thing
+    in the physics core.
+
+    The other Ψ/Δ tests are internal: round trips and cross-checks between our own
+    functions. Those catch a broken composition but cannot catch a *convention*
+    error, because both sides share it. This one computes ``ρ = r_p / r_s`` from
+    the ``tmm`` package's coefficients and compares. Sign conventions, branch
+    choices and phase references all have to agree with somebody else's code.
+
+    That failure mode is not hypothetical. A reimplementation of this model in
+    JavaScript, written the same day, had a phase-sign error that left reflectance
+    almost unchanged and shifted Δ by up to 180° — invisible in an intensity plot,
+    and caught only by comparing against this Python model.
+
+    Normal incidence is excluded: ``tmm``'s s/p convention differs from §4.2's
+    there, where the two polarisations describe the same wave in coordinate
+    systems that differ by a flip. ``test_delta_is_180_degrees_at_normal_incidence``
+    covers that case against the closed form instead.
+    """
+    grid = torch.tensor(REFERENCE_SPECTRUM)
+    psi, delta = pt.stack_psi_delta(grid, thicknesses, indices, theta_0)
+
+    for i, wavelength in enumerate(REFERENCE_SPECTRUM):
+        r_s = _reference_r("s", indices, thicknesses, theta_0, wavelength)
+        r_p = _reference_r("p", indices, thicknesses, theta_0, wavelength)
+        if abs(r_s) < 1e-9:
+            continue          # ρ is undefined where r_s vanishes (Brewster-like)
+        expected = r_p / r_s
+
+        assert float(torch.tan(psi[i])) == pytest.approx(abs(expected), rel=1e-9), (
+            f"{name} at {theta_0} rad, {wavelength} nm: Ψ disagrees"
+        )
+        # Compared on the circle, because Δ and Δ+2π are the same angle.
+        difference = float(delta[i]) - np.angle(expected)
+        assert np.cos(difference) == pytest.approx(1.0, abs=1e-12), (
+            f"{name} at {theta_0} rad, {wavelength} nm: Δ disagrees by "
+            f"{np.degrees((difference + np.pi) % (2 * np.pi) - np.pi):.3f}°"
+        )
+
+
+@pytest.mark.parametrize(("name", "thicknesses", "indices"), REFERENCE_STACKS)
+def test_the_ellipsometric_ratio_matches_the_reference_package(name, thicknesses, indices):
+    """The same check on :func:`stack_rho` directly.
+
+    ``stack_psi_delta`` and ``stack_rho`` are separate entry points, and mutation
+    testing showed they are guarded separately: scaling one by 1% trips a
+    different set of tests from scaling the other. Both are used — the generator
+    calls ``stack_rho`` to apply spectrometer bandwidth to the complex ratio —
+    so both need an external reference.
+    """
+    grid = torch.tensor(REFERENCE_SPECTRUM)
+    theta_0 = 1.0
+
+    rho = pt.stack_rho(grid, thicknesses, indices, theta_0).numpy()
+    for i, wavelength in enumerate(REFERENCE_SPECTRUM):
+        r_s = _reference_r("s", indices, thicknesses, theta_0, wavelength)
+        if abs(r_s) < 1e-9:
+            continue
+        expected = _reference_r("p", indices, thicknesses, theta_0, wavelength) / r_s
+        assert rho[i] == pytest.approx(expected, rel=1e-9), f"{name} at {wavelength} nm"
