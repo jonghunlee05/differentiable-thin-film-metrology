@@ -51,3 +51,26 @@ corruption:
 batch:
   count: 64
   seed: 0
+
+# Learned inversion, DTFM-039. Spec §7.2 caps the ambition deliberately:
+# "do not reach for a transformer" — architecture novelty is not what is being
+# assessed, and the interesting question is DTFM-041's uncertainty head, not this.
+model:
+  architecture: mlp       # 'cnn' arrives at DTFM-040
+  input_size: 400         # 200 psi + 200 delta, from the spectrum block above
+  width: 256
+  depth: 3
+  uncertainty: false      # the second head; unused until DTFM-042 supplies its loss
+  # Widens the output sigmoid beyond the prior. A sigmoid is flat at its ends, so
+  # films at the edge of a log-uniform prior learn slowly there. Measured across
+  # runs 1 and 2: margin 0.2 improved the training loss 2.6x and made the median
+  # thickness error 7% WORSE, while putting 4.3% of predictions outside the prior.
+  # The loss is only about half thickness, so it improved on the other half.
+  # Kept at 0 because the guarantee is worth more than a loss number.
+  output_margin: 0.0
+
+training:
+  steps: 8000             # ~2M films; past a few million the physics is re-learnt
+  batch: 256              # measured — the generator's throughput peaks near here
+  lr: 1.0e-3              # cosine decay: DTFM-031 measured Adam settling at its step size
+  seed: 0
