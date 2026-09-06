@@ -41,9 +41,9 @@ Nothing here computes physics. Every number comes from `src/`.""")
 )
 
 cells.append(
-    code("""import numpy as np
+    code("""import matplotlib.pyplot as plt
+import numpy as np
 import torch
-import matplotlib.pyplot as plt
 
 from src import baseline as bl
 from src import dispersion as dp
