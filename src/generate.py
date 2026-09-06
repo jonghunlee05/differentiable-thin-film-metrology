@@ -57,6 +57,30 @@ class Measurement:
     5 to 23x better thickness precision, with the largest gains in the thin
     regime the project is written about.
 
+    **What instrument this is.** Until DTFM-034 these numbers were judgement
+    calls. They are now anchored to the J.A. Woollam M-2000, the standard
+    spectroscopic ellipsometer for this measurement:
+
+    | | this project | M-2000 |
+    |---|---|---|
+    | range | 400-800 nm | 371-1689 nm |
+    | resolution | 3.0 nm | ~3 nm UV-VIS, ~6 nm NIR |
+    | wavelengths | 200 | "hundreds", CCD |
+    | Δ noise | 1e-3 rad (0.057°) | — |
+
+    The 3 nm slit width matches the real UV-VIS figure exactly; the band is a
+    deliberate subset. **The noise figure remains unvalidated**: vendors quote
+    thickness repeatability rather than angular precision, and the two are not
+    interconvertible without the vendor's own model.
+
+    That gap has a measurable consequence. DTFM-034's Cramér-Rao bound gives
+    ±0.006 nm for a 420 nm film, while real tools claim repeatability "better
+    than 0.1 nm" — so this project's floor is **roughly 16x more optimistic than
+    a real instrument achieves**. Not a contradiction: the bound is photon-noise
+    limited, while a tool's repeatability also carries stage positioning,
+    temperature drift and the fact that no optical model describes a real film
+    exactly. It is a limitation worth stating rather than leaving implicit.
+
     ``reflectance`` is retained rather than removed. §10 wants both, and the
     comparison is the evidence for the decision.
 
