@@ -1,0 +1,46 @@
+# The long-run sweep — DTFM-070, second pass.
+#
+#   gh workflow run sweep.yml --ref DTFM-070-long-runs \
+#       -f config=configs/sweep_long.yaml -f runs=30
+#
+# 30 runs, about 5.7 hours of wall clock on 20 machines. Longest single job is
+# 4.4 hours against a 6-hour per-job ceiling.
+#
+# WHY THIS AND NOT ANOTHER ARCHITECTURE GRID. The first pass swept 36
+# configurations and found that training length was worth a factor of 2-3 while
+# architecture, once error bars were attached, was worth close to nothing: the
+# best CNN came in at 1.428 +/- 0.327 nm and the best MLP at 1.486 +/- 0.039,
+# a 4% gap inside a 23% spread. Every top configuration was also still improving
+# by 37-54% when its 48,000 steps ran out. Sweeping architecture again would be
+# refining a variable that is not the limiting one.
+#
+# So: 120,000 steps, 2.5x the last pass, on the six configurations that led it.
+#
+# FIVE SEEDS, NOT THREE. Seed variance is the dominant source of uncertainty here,
+# and a standard deviation estimated from three samples is itself very noisy —
+# which is how DTFM-040's single-seed comparison produced a 20% "win" that was not
+# there. Five tightens the error bar enough to tell a real gap from a lucky draw.
+#
+# WHY 120,000 AND NOT 150,000. At 150,000 the largest CNN takes 5.5 hours against
+# a hard 6-hour kill, and a job that hits that wall loses everything: the workflow
+# starts each job from a fresh checkout, so `runs/` is empty and there is no
+# checkpoint to resume from. Cross-job resume would need the workflow to restore
+# the previous artifact first — worth building before any run goes past ~5 hours,
+# and not yet built. 120,000 leaves 1.6 hours of margin.
+#
+# STILL UNDER MSE, which DTFM-042 replaces. The training-length conclusion should
+# transfer; the architecture ranking may not.
+
+kernel: 7
+batch: 256
+lr: 1.0e-3
+output_margin: 0.0
+checkpoint_every: 5000
+
+sweep:
+  architecture: [mlp, cnn]
+  width: [256, 512]        # mlp only
+  channels: [64]           # cnn only
+  depth: [2, 3]
+  steps: [120000]
+  seed: [0, 1, 2, 3, 4]
