@@ -1,12 +1,35 @@
 # The lambda_recon ablation, under the loss that replaced MSE — DTFM-045, §7.3.
 #
 #   gh workflow run sweep.yml --ref DTFM-045-lambda-ablation \
-#       -f config=configs/sweep_nll.yaml -f runs=24
+#       -f config=configs/sweep_nll.yaml -f runs=40
 #
-# 24 runs, about 3.4 hours of wall clock. Longest single job 3.4 hours against a
-# 6-hour per-job ceiling, which matters more than usual here: the workflow starts
-# each job from a fresh checkout with an empty runs/, so a job killed at the wall
-# loses everything. There is no cross-job resume yet.
+# 40 runs, about 6.3 hours of wall clock on 20 machines. Longest single job 4.2
+# hours against a 6-hour per-job ceiling, which matters more than usual here: the
+# workflow starts each job from a fresh checkout with an empty runs/, so a job
+# killed at the wall loses everything. There is no cross-job resume yet.
+#
+# TIMINGS ARE MEASURED, NOT GUESSED. DTFM-070 recorded mlp-w512-d3 at 83.8 s per
+# 1000 steps on a hosted runner against 62 ms/step on the laptop these were sized
+# from, so the runner is 1.35x slower and every figure here carries that factor.
+# An earlier 1.1x guess understated this sweep by 45 minutes.
+#
+# FIVE SEEDS RATHER THAN THREE, because a standard deviation estimated from three
+# samples is itself noisy -- which is how DTFM-040 produced a 20% architecture
+# win that five seeds later showed was about 8% and not against the whole field.
+# The whole point of this sweep is to compare four lambda values, and comparing
+# them without trustworthy error bars would repeat that mistake on a new axis.
+#
+# WHAT WAS CONSIDERED AND REJECTED:
+#
+#   144,000 steps -- the natural next question, since nothing has ever converged
+#   in this project. With the reconstruction term that is a 6.2-hour job against
+#   a 6-hour kill, and no resume, so it would lose everything at the wall. This
+#   is the concrete argument for building cross-job resume before the next sweep.
+#
+#   A fifth lambda value -- 8.4 hours of wall clock, longer than the night.
+#
+#   The CNN -- 6.3 hours for a single 48k run with the reconstruction term, over
+#   the cap outright. Even at lambda 0 it is 5.4 hours with no margin.
 #
 # WHY THIS AND NOT MORE ARCHITECTURE. DTFM-042 measured the loss against the same
 # network at the same length: 4,000 steps of MSE gave 7.038 nm of thickness and
@@ -53,4 +76,4 @@ uncertainty: true
 sweep:
   lambda_recon: [0.0, 0.0001, 0.001, 0.01]
   steps: [48000, 96000]
-  seed: [0, 1, 2]
+  seed: [0, 1, 2, 3, 4]
