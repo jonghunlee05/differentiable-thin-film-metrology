@@ -203,3 +203,101 @@ def test_a_run_does_not_write_into_the_project_history(tmp_path):
 
     assert (tmp_path / "runs" / "history.jsonl").exists(), "history sits beside the runs"
     assert not (tmp_path / "history.jsonl").exists()
+
+
+# --- DTFM-042: the losses reaching the training loop --------------------------
+
+
+def test_the_default_run_name_is_unchanged_by_the_new_fields():
+    """141 runs are already in the history under the old naming.
+
+    If adding the DTFM-042 fields renamed the default configuration, every one of
+    those rows would stop matching a re-run of the same settings, and the whole
+    recorded history would become incomparable to anything measured afterwards.
+    """
+    assert tr.RunConfig().name == "mlp-w256-d3-s8000-seed0"
+
+
+def test_the_run_name_distinguishes_the_loss_settings():
+    """``expand_sweep`` deduplicates on the name, so a field missing from it does
+    not produce a confusing directory — it silently deletes runs.
+
+    DTFM-045 ablates λ_recon. Without it in the name every arm of that ablation
+    collapses to one run, and the collapse looks like agreement rather than loss.
+    """
+    assert tr.RunConfig(uncertainty=True).name == "mlp-w256-d3-s8000-nll-seed0"
+    assert tr.RunConfig(uncertainty=True, lambda_recon=0.1).name == (
+        "mlp-w256-d3-s8000-nll-rec0.1-seed0"
+    )
+
+
+def test_an_ablation_over_lambda_recon_does_not_deduplicate():
+    runs = tr.expand_sweep(
+        {"uncertainty": True, "sweep": {"lambda_recon": [0.0, 0.01, 0.1, 1.0]}}
+    )
+
+    assert len({r.name for r in runs}) == 4, [r.name for r in runs]
+
+
+def test_a_run_with_the_head_records_what_its_uncertainty_did(tmp_path):
+    """Not calibration — that is DTFM-048 through DTFM-050. Enough to tell a
+    trained head from an untrained one without opening the checkpoint.
+    """
+    record = tr.train(
+        _tiny(uncertainty=True, lambda_recon=0.1),
+        wavelengths_nm=WAVELENGTHS,
+        directory=tmp_path / "r",
+        progress=False,
+    )
+
+    for field in ("sigma_median_nm", "sigma_error_correlation", "within_one_sigma"):
+        assert field in record, f"{field} missing"
+    assert np.isfinite(record["sigma_median_nm"])
+    assert record["sigma_median_nm"] > 0
+
+
+def test_a_run_without_the_head_reports_no_uncertainty_fields(tmp_path):
+    record = tr.train(
+        _tiny(), wavelengths_nm=WAVELENGTHS, directory=tmp_path / "r", progress=False
+    )
+
+    assert "sigma_median_nm" not in record
+
+
+def test_the_loss_parts_are_recorded_alongside_the_total(tmp_path):
+    """With two terms in different units the total cannot say which one moved.
+
+    DTFM-045 reads these to attribute a change to the reconstruction term rather
+    than to the fit, and a run log holding only the total makes that impossible
+    after the fact rather than merely inconvenient.
+    """
+    record = tr.train(
+        _tiny(uncertainty=True, lambda_recon=0.5),
+        wavelengths_nm=WAVELENGTHS,
+        directory=tmp_path / "r",
+        progress=False,
+    )
+
+    assert record["loss_parts"], "no breakdown recorded"
+    _, parts = record["loss_parts"][-1]
+    assert set(parts) == {"fit", "recon", "total"}
+    assert parts["total"] == pytest.approx(parts["fit"] + 0.5 * parts["recon"], rel=1e-5)
+
+
+def test_the_physics_term_is_skipped_entirely_when_its_weight_is_zero(tmp_path):
+    """λ_recon = 0 must not run the transfer matrix and multiply it by nothing.
+
+    The reconstruction term is the expensive part of a step — a full stack over
+    200 wavelengths per film — so computing and discarding it would make the
+    control arm of DTFM-045's ablation as slow as its treatment arm, and every
+    run in the existing history slower for no result.
+    """
+    record = tr.train(
+        _tiny(uncertainty=True, lambda_recon=0.0),
+        wavelengths_nm=WAVELENGTHS,
+        directory=tmp_path / "r",
+        progress=False,
+    )
+
+    _, parts = record["loss_parts"][-1]
+    assert "recon" not in parts
