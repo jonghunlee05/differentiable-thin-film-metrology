@@ -123,6 +123,61 @@ class ParameterScaler:
     def decode(self, unit: torch.Tensor) -> torch.Tensor:
         return self.low + unit * self.span
 
+    def decode_sigma(self, sigma_cube: torch.Tensor) -> torch.Tensor:
+        """Convert a standard deviation from cube units to physical units.
+
+        ``decode`` is affine — ``low + u·span`` — and a standard deviation is a
+        *width*, so only the scale survives: the offset shifts an estimate but
+        cannot shift a spread. Hence ``span``, without ``low``.
+
+        The factor is not small. For thickness ``span`` is 1980 nm at margin 0,
+        so a σ̂ of 0.001 in cube units is **1.98 nm**, not 0.001 nm. Reporting the
+        raw head output as a nanometre uncertainty would understate it by roughly
+        three orders of magnitude — and it would look plausible, because a
+        picometre error bar is exactly what a reader hopes to see.
+        """
+        return sigma_cube * self.span
+
+    def sigma_from_log_var(self, log_var: torch.Tensor) -> torch.Tensor:
+        """``log σ̂²`` (cube units, as the head emits it) → ``σ̂`` in physical units.
+
+        Why the head predicts a log-variance rather than σ directly: a standard
+        deviation must be positive and a linear layer can emit anything. Under
+        this parameterisation every real number is a valid output, ``σ = exp(½
+        log σ²)`` is positive by construction, and DTFM-042's NLL never divides
+        by zero. No clamping of the *output* is needed — only of the range, which
+        :func:`clamp_log_var` handles for a different reason.
+        """
+        return self.decode_sigma(torch.exp(0.5 * clamp_log_var(log_var)))
+
+
+#: Bounds on ``log σ̂²`` in cube units, applied wherever the head's output is used.
+#:
+#: The Gaussian NLL contains ``(θ̂ − θ)² / σ̂²``. Nothing in that expression stops
+#: the network from driving ``log σ̂²`` towards −∞ on films it happens to fit well
+#: early in training: doing so makes the first term enormous but the gradient
+#: points that way locally, and the run dies with a NaN rather than converging.
+#: The upper bound matters less but is not free either — an unbounded σ̂ lets the
+#: network answer "I have no idea" everywhere, which minimises the loss while
+#: predicting nothing.
+#:
+#: The range below is generous rather than tuned. In cube units the whole
+#: parameter space is 1 wide, so σ̂ = 1 is total ignorance; the bounds correspond
+#: to roughly 0.9e-3 to 20 in cube units, or about 1.8 nm to well past the prior
+#: for thickness. It exists to keep the arithmetic finite, not to encode a belief.
+LOG_VAR_BOUNDS = (-14.0, 6.0)
+
+
+def clamp_log_var(log_var: torch.Tensor) -> torch.Tensor:
+    """Keep ``log σ̂²`` inside :data:`LOG_VAR_BOUNDS`.
+
+    Clamping rather than the softer ``softplus`` shaping because a hard bound is
+    visible: a σ̂ sitting exactly on the boundary is a signal that the head has
+    saturated, and that is worth being able to see and count. A smooth squashing
+    would hide the same failure as a merely small number.
+    """
+    return log_var.clamp(*LOG_VAR_BOUNDS)
+
 
 class InverseMLP(nn.Module):
     """§7.2's first architecture: spectrum in, parameters out.
@@ -181,6 +236,26 @@ class InverseMLP(nn.Module):
         if self.head_log_var is None:
             return theta
         return theta, self.head_log_var(features)
+
+
+    def predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(θ̂, σ̂)`` in physical units — nanometres and dispersion coefficients.
+
+        This is the method anything outside the training loop should call.
+        :meth:`forward` returns ``log σ̂²`` in cube units because that is what the
+        loss consumes; every other consumer — a figure, a report, a comparison
+        against DTFM-034's Cramér-Rao bound — wants nanometres, and converting at
+        each call site is how the two would eventually disagree.
+
+        ``σ̂`` is ``None`` when the model was built without the head, rather than
+        zeros. A zero uncertainty is a *claim* — perfect confidence — and a model
+        that was never given the head has not made it.
+        """
+        out = self(x)
+        if isinstance(out, tuple):
+            theta, log_var = out
+            return theta, self.scale_theta.sigma_from_log_var(log_var)
+        return out, None
 
     @property
     def parameter_count(self) -> int:
@@ -262,6 +337,26 @@ class InverseCNN(nn.Module):
         if self.head_log_var is None:
             return theta
         return theta, self.head_log_var(features)
+
+
+    def predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(θ̂, σ̂)`` in physical units — nanometres and dispersion coefficients.
+
+        This is the method anything outside the training loop should call.
+        :meth:`forward` returns ``log σ̂²`` in cube units because that is what the
+        loss consumes; every other consumer — a figure, a report, a comparison
+        against DTFM-034's Cramér-Rao bound — wants nanometres, and converting at
+        each call site is how the two would eventually disagree.
+
+        ``σ̂`` is ``None`` when the model was built without the head, rather than
+        zeros. A zero uncertainty is a *claim* — perfect confidence — and a model
+        that was never given the head has not made it.
+        """
+        out = self(x)
+        if isinstance(out, tuple):
+            theta, log_var = out
+            return theta, self.scale_theta.sigma_from_log_var(log_var)
+        return out, None
 
     @property
     def parameter_count(self) -> int:

@@ -273,3 +273,134 @@ def test_the_cnn_is_reproducible_from_its_config():
     assert first.parameter_count == second.parameter_count
     for a, b in zip(first.parameters(), second.parameters(), strict=True):
         assert torch.equal(a, b)
+
+
+# --- DTFM-041, the heteroscedastic head ---------------------------------------
+#
+# §7.2, §8.1. The head itself was wired during DTFM-039/040 so the two
+# architectures could not diverge in how they express it. What follows is the
+# rest: getting σ̂ out in units anyone can act on, and keeping the arithmetic
+# finite before DTFM-042's NLL starts dividing by it.
+
+
+@pytest.mark.parametrize("architecture", ["mlp", "cnn"])
+def test_sigma_comes_back_in_nanometres_not_cube_units(architecture):
+    """The conversion this ticket exists for, checked against the arithmetic.
+
+    The head emits ``log σ̂²`` in cube coordinates. A σ̂ of 0.001 there is 1.98 nm,
+    not 0.001 nm — a factor of 1980. An error of that size would not look like an
+    error: a picometre uncertainty is precisely what a hopeful reader expects to
+    see on a metrology result, and it would be reported rather than questioned.
+    """
+    prior = gen.Prior()
+    model = models.build_model({"architecture": architecture, "uncertainty": True}, prior=prior)
+
+    _, log_var = model(torch.randn(8, 400))
+    _, sigma = model.predict(torch.randn(8, 400))
+
+    span = model.scale_theta.span
+    assert torch.allclose(
+        model.scale_theta.sigma_from_log_var(log_var),
+        torch.exp(0.5 * models.clamp_log_var(log_var)) * span,
+    )
+    assert span[0].item() == pytest.approx(1980.0), "prior thickness span, 20-2000 nm"
+    assert (sigma > 0).all(), "a standard deviation is positive by construction"
+    assert torch.isfinite(sigma).all()
+
+
+def test_converting_sigma_uses_the_scale_and_not_the_offset():
+    """``decode`` is ``low + u·span``; a spread is a width, so only ``span`` acts.
+
+    Applying the full affine map to a standard deviation would add the prior's
+    lower bound — 20 nm for thickness — to every uncertainty, giving a model that
+    can never claim to know anything better than 20 nm however well it fits.
+    """
+    scaler = models.ParameterScaler(gen.Prior())
+    sigma_cube = torch.tensor([[0.001, 0.001, 0.001]])
+
+    physical = scaler.decode_sigma(sigma_cube)
+
+    assert physical[0, 0].item() == pytest.approx(1.98), "0.001 x 1980 nm"
+    assert not torch.allclose(physical, scaler.decode(sigma_cube)), "decode would add `low`"
+
+
+@pytest.mark.parametrize("architecture", ["mlp", "cnn"])
+def test_a_model_without_the_head_reports_no_uncertainty_rather_than_zero(architecture):
+    """``None``, not zeros. A σ̂ of zero is a claim of perfect confidence, and a
+    model that was never given the head has not made that claim. Returning zeros
+    would let it flow silently into a calibration plot as infinite precision.
+    """
+    model = models.build_model({"architecture": architecture}, prior=gen.Prior())
+
+    theta, sigma = model.predict(torch.randn(4, 400))
+
+    assert theta.shape == (4, 3)
+    assert sigma is None
+
+
+def test_log_variance_is_bounded_so_the_nll_cannot_divide_by_nothing():
+    """DTFM-042's NLL contains ``(θ̂ − θ)² / σ̂²``.
+
+    Nothing in that expression stops the network from driving ``log σ̂²`` towards
+    −∞ on films it fits well early in training. The local gradient points that
+    way, σ̂² underflows to zero, and the run ends in a NaN instead of converging.
+    The bound is what makes the loss safe to write in the first place.
+    """
+    extreme = torch.tensor([[-500.0, 0.0, 500.0]])
+
+    clamped = models.clamp_log_var(extreme)
+    sigma = models.ParameterScaler(gen.Prior()).sigma_from_log_var(extreme)
+
+    low, high = models.LOG_VAR_BOUNDS
+    assert clamped[0, 0].item() == low
+    assert clamped[0, 2].item() == high
+    assert (sigma > 0).all() and torch.isfinite(sigma).all()
+    assert torch.isfinite(1.0 / sigma**2).all(), "the term the NLL actually computes"
+
+
+@pytest.mark.parametrize("architecture", ["mlp", "cnn"])
+def test_sigma_varies_with_the_input(architecture):
+    """§8.1's requirement: the uncertainty is *heteroscedastic* — it depends on the
+    film being measured, not one number shared by every prediction.
+
+    That is the whole point. Some films are genuinely ambiguous — a thicker film
+    with a lower index produces nearly the spectrum of a thinner one with a
+    higher index — and a single global error bar could not say so.
+
+    NOTE what this does and does not show. It shows the head is *wired* to the
+    input rather than to a bias term: different spectra, different σ̂. It does not
+    show that σ̂ is **correct**, because nothing has trained it yet. That
+    demonstration needs DTFM-042's NLL and belongs there; an untrained head that
+    varies with input is varying the way any random linear layer varies.
+    """
+    prior = gen.Prior()
+    torch.manual_seed(0)
+    model = models.build_model({"architecture": architecture, "uncertainty": True}, prior=prior)
+    batch = ds.sample_batch(32, WAVELENGTHS, np.random.default_rng(0), prior=prior)
+
+    _, sigma = model.predict(batch.observed.float())
+
+    thickness_sigma = sigma[:, 0]
+    assert thickness_sigma.std() > 0, "a constant σ̂ would not be heteroscedastic"
+    assert thickness_sigma.min() != thickness_sigma.max()
+
+
+@pytest.mark.parametrize("architecture", ["mlp", "cnn"])
+def test_an_untrained_head_admits_it_knows_nothing(architecture):
+    """A sanity check on the units, expressed as a physical statement.
+
+    At initialisation the head's output sits near zero, so σ̂ in cube units is
+    near 1 — and 1 in cube units is the entire prior. An untrained model should
+    therefore report an uncertainty of roughly the full 20-2000 nm range, which
+    is the correct thing for it to say. If the conversion were wrong by the 1980x
+    factor this test would instead see about a nanometre, which would look like a
+    superbly calibrated network that had never been trained.
+    """
+    torch.manual_seed(0)
+    model = models.build_model(
+        {"architecture": architecture, "uncertainty": True}, prior=gen.Prior()
+    )
+
+    _, sigma = model.predict(torch.randn(16, 400))
+
+    assert sigma[:, 0].median() > 500.0, "an untrained head should claim near-total ignorance"
