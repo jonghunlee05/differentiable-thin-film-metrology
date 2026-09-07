@@ -20,3 +20,27 @@ lr: 1.0e-3
 seed: 0
 checkpoint_every: 1000
 label: ""
+
+# DTFM-042 — the loss. `L = L_nll + lambda_recon * L_recon`
+#
+# uncertainty: turns on DTFM-041's second head and switches the fit term from
+#   mean squared error to Gaussian NLL. The two go together: under MSE the head
+#   receives no gradient at all, so it would report a sigma frozen at
+#   initialisation -- roughly 2000 nm of thickness, the whole prior -- which
+#   would read as a measurement rather than as an untrained number.
+#
+# lambda_recon: weight on the physics term, which pushes the network's own guess
+#   back through the transfer matrix and compares the result against the spectrum
+#   it started from. This is what makes the project scientific ML rather than
+#   regression on physics-generated data.
+#
+#   Leave it at 0 to reproduce the 141 runs already in the history exactly.
+#   DTFM-045 settles the value; anything set here before that ablation is a guess
+#   and should be labelled as one.
+#
+#   Note the term has a FLOOR it cannot go below. The network predicts three
+#   parameters; a film also has 0-4 nm of surface roughness (§4.5) and the
+#   observation carries instrument noise. Neither is predicted, so f(theta) can
+#   never match an observation even when theta is exactly right.
+uncertainty: false
+lambda_recon: 0.0

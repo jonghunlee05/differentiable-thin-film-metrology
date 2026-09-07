@@ -37,10 +37,10 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
-from torch import nn
 
 from src import dataset as ds
 from src import generate as gen
+from src import losses as ls
 from src import models
 
 __all__ = [
@@ -80,12 +80,23 @@ class RunConfig:
     checkpoint_every: int = 1000
     label: str = ""
 
+    # DTFM-042. `uncertainty` turns on DTFM-041's second head, and is only
+    # meaningful together with the NLL it enables: under MSE the head receives no
+    # gradient at all, so a run that set this alone would report a sigma frozen at
+    # initialisation. `train` refuses that combination rather than producing it.
+    uncertainty: bool = False
+    #: Weight on the physics reconstruction term. 0 reproduces every run in the
+    #: existing 141-run history exactly, which is what makes them comparable to
+    #: anything measured after this ticket. DTFM-045 settles the value.
+    lambda_recon: float = 0.0
+
     def model_settings(self) -> dict[str, Any]:
         settings = {
             "architecture": self.architecture,
             "depth": self.depth,
             "output_margin": self.output_margin,
             "width": self.width if self.architecture == "mlp" else 128,
+            "uncertainty": self.uncertainty,
         }
         if self.architecture == "cnn":
             settings |= {"channels": self.channels, "kernel": self.kernel}
@@ -93,13 +104,31 @@ class RunConfig:
 
     @property
     def name(self) -> str:
-        """A directory name that says what the run was without opening it."""
+        """A directory name that says what the run was without opening it.
+
+        **Every field that changes the result must appear here**, because
+        :func:`expand_sweep` deduplicates on this string. A field left out does
+        not merely produce a confusing directory name — it silently collapses a
+        sweep. That was DTFM-043's bug: architectures ignoring each other's
+        fields turned eight runs into four, and the four missing ones did not
+        look missing, they looked like machines reproducing each other.
+
+        ``lambda_recon`` is here for exactly that reason. DTFM-045 is an ablation
+        over it, and without it in the name every arm of that ablation would
+        deduplicate down to a single run.
+        """
         shape = (
             f"w{self.width}"
             if self.architecture == "mlp"
             else f"c{self.channels}k{self.kernel}"
         )
-        stem = f"{self.architecture}-{shape}-d{self.depth}-s{self.steps}-seed{self.seed}"
+        stem = f"{self.architecture}-{shape}-d{self.depth}-s{self.steps}"
+        if self.uncertainty:
+            stem += "-nll"
+        if self.lambda_recon:
+            # `g` so 0.1 is "0.1" rather than "0.100000", and 1e-3 stays short.
+            stem += f"-rec{self.lambda_recon:g}"
+        stem += f"-seed{self.seed}"
         return f"{self.label}-{stem}" if self.label else stem
 
 
@@ -202,7 +231,12 @@ def evaluate(model, prior, wavelengths_nm, films: int = 2000, seed: int = 999) -
     model.eval()
     batch = ds.sample_batch(films, wavelengths_nm, np.random.default_rng(seed), prior=prior)
     with torch.no_grad():
-        predicted = model(batch.observed.float())
+        # `predict` rather than `forward`: it returns sigma in nanometres of
+        # thickness, and copes with either head arrangement. Calling the model
+        # directly would hand back a tuple once DTFM-041's head is on, and
+        # `predicted[:, 0]` would then silently index the first *parameter of the
+        # tuple* rather than the thickness.
+        predicted, sigma = model.predict(batch.observed.float())
     error = (predicted[:, 0] - batch.targets[:, 0]).numpy()
     truth = batch.targets[:, 0].numpy()
 
@@ -213,6 +247,20 @@ def evaluate(model, prior, wavelengths_nm, films: int = 2000, seed: int = 999) -
         "wrong_over_1nm": float(np.mean(np.abs(error) > 1.0)),
         "outside_prior": float(model.scale_theta.outside_prior(predicted).float().mean()),
     }
+    if sigma is not None:
+        # A first, cheap read on whether sigma means anything: the correlation
+        # between the uncertainty the model states and the error it actually
+        # makes. Calibration proper — coverage, reliability diagrams, the
+        # Cramer-Rao comparison — is DTFM-048 through DTFM-050. This is only
+        # enough to tell a trained head from an untrained one at a glance.
+        sigma_nm = sigma[:, 0].numpy()
+        report |= {
+            "sigma_median_nm": float(np.median(sigma_nm)),
+            "sigma_error_correlation": float(
+                np.corrcoef(sigma_nm, np.abs(error))[0, 1]
+            ),
+            "within_one_sigma": float(np.mean(np.abs(error) <= sigma_nm)),
+        }
     for name, low, high in (("thin", 0, 100), ("mid", 100, 700), ("thick", 700, np.inf)):
         mask = (truth >= low) & (truth < high)
         if mask.any():
@@ -273,6 +321,14 @@ def train(
     # was never assigned. Left unset this raised *after* training, with the
     # weights already on disk and the result lost.
     final_loss = curve[-1][1] if curve else float("nan")
+    breakdown: list[tuple[int, dict[str, float]]] = []
+
+    # Built once per run, not per step: the substrate's nk table and the
+    # wavelength grid are fixed by the instrument, and reloading them 120,000
+    # times would cost more than the term they serve.
+    reconstruct = (
+        ls.Reconstructor(wavelengths_nm, prior=prior) if config.lambda_recon else None
+    )
 
     for step in range(start + 1, config.steps + 1):
         mark = time.perf_counter()
@@ -281,9 +337,16 @@ def train(
 
         model.train()
         optimiser.zero_grad()
-        loss = nn.functional.mse_loss(
-            scaler.encode(model(batch.observed.float())),
-            scaler.encode(batch.targets).float(),
+        predicted = model(batch.observed.float())
+        theta_hat, log_var = predicted if isinstance(predicted, tuple) else (predicted, None)
+        loss, parts = ls.total_loss(
+            theta_hat,
+            batch.targets,
+            batch.observed,
+            scaler,
+            log_var=log_var,
+            reconstruct=reconstruct,
+            lambda_recon=config.lambda_recon,
         )
         loss.backward()
         optimiser.step()
@@ -292,6 +355,11 @@ def train(
 
         if step % max(config.steps // 100, 1) == 0:
             curve.append((step, float(loss.item())))
+            # The parts alongside the total. With two terms in different units a
+            # single number cannot say which one moved, and DTFM-045's ablation
+            # reads exactly these. Recorded on the same stride as the curve so the
+            # two are always the same length.
+            breakdown.append((step, parts))
         if step % config.checkpoint_every == 0 or step == config.steps:
             Checkpoint(
                 step, model.state_dict(), optimiser.state_dict(),
@@ -324,6 +392,7 @@ def train(
         **evaluate(model, prior, wavelengths_nm),
         "final_loss": final_loss,
         "loss_curve": curve,
+        "loss_parts": breakdown,
         "train_seconds": elapsed,
         "generating_fraction": generating / elapsed,
         "inference_us": per_film * 1e6,
