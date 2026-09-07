@@ -1,9 +1,9 @@
 # The lambda_recon ablation, under the loss that replaced MSE — DTFM-045, §7.3.
 #
 #   gh workflow run sweep.yml --ref DTFM-045-lambda-ablation \
-#       -f config=configs/sweep_nll.yaml -f runs=40
+#       -f config=configs/sweep_nll.yaml -f runs=75
 #
-# 40 runs, about 6.3 hours of wall clock on 20 machines. Longest single job 4.2
+# 75 runs, about 8.5 hours of wall clock on 20 machines. Longest single job 4.2
 # hours against a 6-hour per-job ceiling, which matters more than usual here: the
 # workflow starts each job from a fresh checkout with an empty runs/, so a job
 # killed at the wall loses everything. There is no cross-job resume yet.
@@ -18,6 +18,15 @@
 # win that five seeds later showed was about 8% and not against the whole field.
 # The whole point of this sweep is to compare four lambda values, and comparing
 # them without trustworthy error bars would repeat that mistake on a new axis.
+#
+# THE TWO AXES ARE CROSSED ON PURPOSE. lambda_recon is swept against three
+# training lengths rather than one, because the best weight for the physics term
+# has no reason to be the same early and late. A constraint that helps a network
+# find the right basin in the first 24,000 steps may be the same constraint that
+# stops it refining inside that basin by 96,000 -- and a single-length ablation
+# would report one number and hide that entirely. DTFM-070 made the matching
+# mistake in the other direction: it compared architectures at a length where
+# none of them had finished learning.
 #
 # WHAT WAS CONSIDERED AND REJECTED:
 #
@@ -74,6 +83,6 @@ checkpoint_every: 4000
 uncertainty: true
 
 sweep:
-  lambda_recon: [0.0, 0.0001, 0.001, 0.01]
-  steps: [48000, 96000]
+  lambda_recon: [0.0, 0.0001, 0.001, 0.003, 0.01]
+  steps: [24000, 48000, 96000]
   seed: [0, 1, 2, 3, 4]
