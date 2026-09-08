@@ -27,6 +27,7 @@ from scipy.optimize import least_squares
 
 from src import dispersion as dp
 from src import generate as gen
+from src import noise as nz
 from src import tmm_torch as pt
 
 __all__ = [
@@ -128,23 +129,39 @@ def forward_observable(
     wavelengths_nm: NDArray,
     measurement: gen.Measurement,
     substrate: torch.Tensor,
+    roughness_nm: float = 0.0,
 ) -> torch.Tensor:
     """The forward model as the fitter sees it: θ in, measured quantity out.
 
     Returns reflectance, or ``(Ψ, Δ)`` concatenated, matching whatever
     :class:`gen.Measurement` selects — so the fitter never needs to know which
     observable it is working with.
+
+    ``roughness_nm`` adds §4.5's Bruggeman surface layer, off by default. The
+    fitter never uses it — it fits three parameters and roughness is not one of
+    them — but the *training* films have it, so a test set built without it is
+    slightly smoother than the distribution a network learned from. DTFM-044
+    measures the size of that gap rather than leaving it implicit.
     """
     thickness, cauchy_a, cauchy_b = parameters
     grid = torch.as_tensor(np.asarray(wavelengths_nm, dtype=float))
     index = dp.cauchy_n((cauchy_a, cauchy_b, 0.0), grid)
     indices = [1.0, index, substrate]
+    layers = [thickness]
+    if roughness_nm > 0.0:
+        # Same construction as dataset.sample_batch: a 50/50 mixture of film and
+        # void, one layer thick as the drawn roughness. Written the same way in
+        # both places on purpose — a benchmark whose physics differs from the
+        # training physics measures the difference between two simulators.
+        mixed = nz.effective_medium_index(index, torch.ones_like(index), 0.5)
+        layers = [roughness_nm, thickness]
+        indices = [1.0, mixed, index, substrate]
     angle = measurement.angle_rad
 
     if measurement.observable == "ellipsometry":
-        psi, delta = pt.stack_psi_delta(grid, [thickness], indices, angle)
+        psi, delta = pt.stack_psi_delta(grid, layers, indices, angle)
         return torch.cat([psi, delta])
-    return pt.stack_reflectance(grid, [thickness], indices, angle, "s")
+    return pt.stack_reflectance(grid, layers, indices, angle, "s")
 
 
 def wrapped_residual(model: NDArray, observed: NDArray, observable: str) -> NDArray:

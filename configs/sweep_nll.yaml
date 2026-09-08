@@ -1,0 +1,88 @@
+# The lambda_recon ablation, under the loss that replaced MSE — DTFM-045, §7.3.
+#
+#   gh workflow run sweep.yml --ref DTFM-045-lambda-ablation \
+#       -f config=configs/sweep_nll.yaml -f runs=75
+#
+# 75 runs, about 8.5 hours of wall clock on 20 machines. Longest single job 4.2
+# hours against a 6-hour per-job ceiling, which matters more than usual here: the
+# workflow starts each job from a fresh checkout with an empty runs/, so a job
+# killed at the wall loses everything. There is no cross-job resume yet.
+#
+# TIMINGS ARE MEASURED, NOT GUESSED. DTFM-070 recorded mlp-w512-d3 at 83.8 s per
+# 1000 steps on a hosted runner against 62 ms/step on the laptop these were sized
+# from, so the runner is 1.35x slower and every figure here carries that factor.
+# An earlier 1.1x guess understated this sweep by 45 minutes.
+#
+# FIVE SEEDS RATHER THAN THREE, because a standard deviation estimated from three
+# samples is itself noisy -- which is how DTFM-040 produced a 20% architecture
+# win that five seeds later showed was about 8% and not against the whole field.
+# The whole point of this sweep is to compare four lambda values, and comparing
+# them without trustworthy error bars would repeat that mistake on a new axis.
+#
+# THE TWO AXES ARE CROSSED ON PURPOSE. lambda_recon is swept against three
+# training lengths rather than one, because the best weight for the physics term
+# has no reason to be the same early and late. A constraint that helps a network
+# find the right basin in the first 24,000 steps may be the same constraint that
+# stops it refining inside that basin by 96,000 -- and a single-length ablation
+# would report one number and hide that entirely. DTFM-070 made the matching
+# mistake in the other direction: it compared architectures at a length where
+# none of them had finished learning.
+#
+# WHAT WAS CONSIDERED AND REJECTED:
+#
+#   144,000 steps -- the natural next question, since nothing has ever converged
+#   in this project. With the reconstruction term that is a 6.2-hour job against
+#   a 6-hour kill, and no resume, so it would lose everything at the wall. This
+#   is the concrete argument for building cross-job resume before the next sweep.
+#
+#   A fifth lambda value -- 8.4 hours of wall clock, longer than the night.
+#
+#   The CNN -- 6.3 hours for a single 48k run with the reconstruction term, over
+#   the cap outright. Even at lambda 0 it is 5.4 hours with no margin.
+#
+# WHY THIS AND NOT MORE ARCHITECTURE. DTFM-042 measured the loss against the same
+# network at the same length: 4,000 steps of MSE gave 7.038 nm of thickness and
+# 4,000 steps of Gaussian NLL gave 1.445. RMSE and p95 improved with it, so it is
+# not a robustness artifact. For scale, the best MSE model in the 141-run history
+# needed 120,000 steps to reach 1.124 nm of thickness. The loss was worth more
+# than thirty times the compute, which makes every run recorded before it a poor
+# guide to what to try next.
+#
+# WHY THE ABLATION IS URGENT. lambda_recon = 0.1 destroyed training: 557 nm of
+# thickness median error, with thin and mid films catastrophic while thick films
+# stayed fine and the reconstruction term itself barely moved. The likely reason
+# is that the reconstruction objective is degenerate -- many (thickness, A, B)
+# triples produce near-identical spectra, which is this project's central
+# difficulty and what DTFM-032's basins measured -- so a physics term strong
+# enough to dominate pulls the network toward spectrum-matching but
+# parameter-wrong solutions. Thick films have crowded fringes that constrain the
+# fit; thin films have few and drift.
+#
+# That is a hypothesis, not a result. The values below span four orders of
+# magnitude below the one that broke, so the ablation can find where the term
+# starts helping and where it starts hurting rather than assuming either.
+#
+# lambda_recon = 0 is the control arm and must stay in: without it there is no
+# way to attribute a change to the physics term rather than to the NLL.
+#
+# WHY MLP-ONLY. DTFM-070 found the CNN and mlp-w512-d3 statistically tied
+# (p = 0.10) with the MLP three times more repeatable across seeds. Under the
+# reconstruction term the CNN also costs 4.6 hours per 48k-step run against the
+# MLP's 1.7, which at a 6-hour ceiling with no resume is a risk taken for a
+# configuration that is not measurably better. The CNN is worth re-checking under
+# NLL, but as its own dispatch rather than as the long pole of this one.
+
+architecture: mlp
+width: 512
+depth: 3
+kernel: 7
+batch: 256
+lr: 1.0e-3
+output_margin: 0.0
+checkpoint_every: 4000
+uncertainty: true
+
+sweep:
+  lambda_recon: [0.0, 0.0001, 0.001, 0.003, 0.01]
+  steps: [24000, 48000, 96000]
+  seed: [0, 1, 2, 3, 4]

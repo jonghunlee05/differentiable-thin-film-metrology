@@ -1,0 +1,52 @@
+# Architecture and learning rate, under the loss that actually matters —
+# DTFM-070 second pass, §7.2/§7.3.
+#
+#   gh workflow run sweep.yml --ref DTFM-045-run-naming \
+#       -f config=configs/sweep_arch_nll.yaml -f runs=60
+#
+# 60 runs, about 5.5 hours of wall clock on 20 machines. Longest single job 3.7
+# hours against the 6-hour per-job kill.
+#
+# WHY REDO THE ARCHITECTURE COMPARISON. DTFM-070 ranked architectures over 138
+# runs, every one of them under mean squared error, and every one still improving
+# when it stopped. DTFM-042 then measured Gaussian NLL as worth more than thirty
+# times the compute -- and, less expectedly, as the thing that finally makes
+# training converge and repeat: seed spreads fell from 2-23% under MSE to 0.8-3.6%
+# under NLL. A ranking measured on undertrained, high-variance runs is not
+# evidence about the converged, low-variance regime the project now trains in.
+#
+# WHY LEARNING RATE. It has never been varied. Every one of the 216 runs recorded
+# so far used 1e-3, chosen at DTFM-039 and never examined. That was defensible
+# while runs were undertrained -- the schedule barely mattered when nothing
+# converged -- and it is not defensible now that they plateau by 96,000 steps.
+#
+# WHY NOT lambda_recon. DTFM-045 ablated it across four orders of magnitude and
+# five seeds: not one value was separable from the control (p = 0.22 to 0.78,
+# gaps under 1% on a 0.617 nm thickness baseline). The reason is visible in the
+# loss breakdown -- the reconstruction term collapses from ~2 to ~0.01 on its own
+# and ends up contributing 0.00% of the total, because accurate parameters
+# reconstruct the spectrum for free. It is held at 0 here. Its remaining value is
+# out-of-distribution robustness (DTFM-053/054) and as an inference-time check
+# that needs no place in the loss at all.
+#
+# WHY 96,000 STEPS AND NOT MORE. Under NLL the loss over the final fifth is flat
+# to within noise at 24k, 48k and 96k alike, and 24k to 96k -- four times the
+# training -- bought 12%. This is the first regime in the project where longer is
+# not obviously better, which is what makes an architecture comparison meaningful
+# at last.
+
+depth: 3
+kernel: 7
+batch: 256
+steps: 96000
+output_margin: 0.0
+checkpoint_every: 8000
+uncertainty: true
+lambda_recon: 0.0
+
+sweep:
+  architecture: [mlp, cnn]
+  width: [256, 512]        # mlp only
+  channels: [32, 64]       # cnn only
+  lr: [0.0003, 0.001, 0.003]
+  seed: [0, 1, 2, 3, 4]
