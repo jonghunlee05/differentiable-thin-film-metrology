@@ -173,6 +173,58 @@ class Report:
         return [row for row in rows if row.get("n", 0) > 0]
 
 
+def network_estimator(
+    model,
+    *,
+    measurement: gen.Measurement | None = None,
+    prior: gen.Prior | None = None,
+) -> Callable[[Case], tuple[NDArray, bool, float]]:
+    """Wrap a trained network in the estimator signature :func:`evaluate` expects.
+
+    This function is the whole reason §10 was written around a callable. The
+    network enters the same table as the fitters, scored on the same cases with
+    the same noise draws, without a second scoring path existing anywhere — and a
+    second scoring path is how two methods end up being compared on quietly
+    different terms.
+
+    Three things are deliberately *not* special-cased for the network:
+
+    ``residual`` is computed with :func:`baseline.wrapped_residual`, the same
+    function the fitters use, so the column means the same thing in every row.
+
+    ``converged`` is ``True`` unless the prediction falls outside the prior. A
+    feed-forward network cannot fail to converge the way an iterative fit can, so
+    reporting it as always-converged would make the column meaningless rather
+    than favourable. What it can do is return something physically impossible,
+    and that is what gets flagged.
+
+    ``seconds`` is measured by :func:`evaluate`, per case, exactly as for the
+    fitters. §3a forbids claiming novelty for the speed result; it is amortised
+    training cost paid once, and the table states it rather than argues from it.
+    """
+    measurement = measurement or gen.Measurement()
+    prior = prior or gen.Prior()
+    substrate_n, substrate_k = dp.load_nk(prior.substrate, np.linspace(400.0, 800.0, 200))
+    substrate = torch.tensor(substrate_n + 1j * substrate_k)
+
+    def estimate(case: Case) -> tuple[NDArray, bool, float]:
+        x = torch.as_tensor(case.observed, dtype=torch.float32)[None, :]
+        model.eval()
+        with torch.no_grad():
+            theta, _sigma = model.predict(x)
+        parameters = theta[0].double().numpy()
+
+        with torch.no_grad():
+            predicted = bl.forward_observable(
+                parameters, case.wavelengths_nm, measurement, substrate
+            ).numpy()
+        residual = bl.wrapped_residual(predicted, case.observed, measurement.observable)
+        inside = not bool(model.scale_theta.outside_prior(theta)[0])
+        return parameters, inside, float(np.sqrt(np.mean(residual**2)))
+
+    return estimate
+
+
 def make_cases(
     count: int = 60,
     *,
@@ -180,6 +232,7 @@ def make_cases(
     wavelengths_nm: NDArray | None = None,
     measurement: gen.Measurement | None = None,
     prior: gen.Prior | None = None,
+    roughness: bool = False,
 ) -> list[Case]:
     """Draw films from the prior and observe each at both noise levels.
 
@@ -188,10 +241,19 @@ def make_cases(
     turns "error grows with noise" from a statement about two samples into a
     paired comparison on one.
 
-    The prior is §7.1's, unmodified. §10's whole argument depends on the test
-    distribution matching the training distribution the network will later see —
-    scoring the baseline on a different draw would make the eventual comparison
-    meaningless.
+    The prior is §7.1's, unmodified.
+
+    **``roughness`` is off by default, and that is a known mismatch.** §4.5 gives
+    every *training* film 0-4 nm of thickness of surface roughness, modelled as a
+    Bruggeman layer; these cases are built from the three fitted parameters alone
+    and have none. So the films DTFM-036 scored the classical baseline on are
+    slightly smoother than the films the network learned from.
+
+    The default is off because DTFM-036's recorded numbers were measured that way
+    and silently changing the test set would invalidate them. Passing ``True``
+    builds cases that match the training distribution instead, and DTFM-044
+    reports both — the gap between them is a small out-of-distribution effect
+    measured on purpose rather than an inconsistency left in place.
     """
     measurement = measurement or gen.Measurement()
     prior = prior or gen.Prior()
@@ -210,7 +272,13 @@ def make_cases(
             [sampled["thickness_nm"][i], sampled["cauchy_a"][i], sampled["cauchy_b"][i]]
         )
         with torch.no_grad():
-            clean = bl.forward_observable(truth, wavelengths_nm, measurement, substrate).numpy()
+            clean = bl.forward_observable(
+                truth,
+                wavelengths_nm,
+                measurement,
+                substrate,
+                roughness_nm=float(sampled["roughness_nm"][i]) if roughness else 0.0,
+            ).numpy()
         for snr, sigma in SNR_LEVELS.items():
             cases.append(
                 Case(

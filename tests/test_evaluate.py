@@ -11,9 +11,11 @@ an error, a failure, or a second per inversion must not.
 
 import numpy as np
 import pytest
+import torch
 
 from src import evaluate as ev
 from src import generate as gen
+from src import models
 
 WAVELENGTHS = np.linspace(400.0, 800.0, 200)
 
@@ -205,3 +207,98 @@ def test_knowing_the_thickness_is_not_enough_for_a_thick_film():
     assert prior.cauchy_a[0] <= thick.truth[1] <= prior.cauchy_a[1], (
         "and that index is inside the prior, so it is a film the network will meet"
     )
+
+
+# --- DTFM-044: the network entering the same table ----------------------------
+
+
+def _tiny_model(prior):
+    torch.manual_seed(0)
+    return models.build_model({"architecture": "mlp", "width": 32, "depth": 1}, prior=prior)
+
+
+def test_a_network_is_scored_by_the_same_function_as_a_fitter():
+    """§10's design, exercised. The estimator signature exists so the learned
+    model enters the table without a second scoring path — and a second scoring
+    path is how two methods end up compared on quietly different terms.
+    """
+    prior = gen.Prior()
+    cases = ev.make_cases(4, seed=0, prior=prior)
+
+    report = ev.evaluate(cases, ev.network_estimator(_tiny_model(prior), prior=prior), prior=prior)
+
+    assert len(report.cases) == len(cases)
+    # thickness only: it is what §10's table scores, and the dispersion
+    # coefficients are nuisance parameters rather than the measurement
+    assert report.estimates.shape == (len(cases),)
+    assert np.isfinite(report.seconds).all()
+    assert set(report.table()[0]) >= {"n", "median_abs_nm", "failure_rate", "seconds"}
+
+
+def test_both_methods_see_the_same_films_and_the_same_noise():
+    """The property that makes the comparison a comparison.
+
+    §10 scores methods, not noise draws. Cases are built once and handed to every
+    estimator, so a difference in the table is a difference in method. Generating
+    fresh observations per method would measure the noise as much as the method.
+    """
+    prior = gen.Prior()
+    cases = ev.make_cases(4, seed=0, prior=prior)
+
+    first = ev.evaluate(cases, ev.network_estimator(_tiny_model(prior), prior=prior), prior=prior)
+    second = ev.evaluate(cases, ev.network_estimator(_tiny_model(prior), prior=prior), prior=prior)
+
+    assert np.array_equal(first.truth, second.truth)
+    for a, b in zip(first.cases, second.cases, strict=True):
+        assert np.array_equal(a.observed, b.observed), (
+            "the same noise draw, not merely the same sigma"
+        )
+
+
+def test_the_rough_test_set_matches_the_training_distribution():
+    """§4.5 gives every training film 0-4 nm of thickness of roughness; the cases
+    DTFM-036 scored the classical baseline on have none.
+
+    That gap is not small — roughness moves Δ by up to 2.3 rad against an
+    instrument sigma of 0.001 rad — and it cuts both ways: on smooth films the
+    fitter's model is exactly right and the network is out of distribution, while
+    on rough films the network is at home and the fitter is misspecified, since
+    it has three parameters and roughness is not one of them.
+
+    Scoring on one alone would flatter whichever method it happened to favour.
+    """
+    prior = gen.Prior()
+    smooth = ev.make_cases(6, seed=0, prior=prior, roughness=False)
+    rough = ev.make_cases(6, seed=0, prior=prior, roughness=True)
+
+    assert np.array_equal(smooth[0].truth, rough[0].truth), "same films, different surfaces"
+    difference = np.abs(smooth[0].observed - rough[0].observed)
+    assert difference.max() > 10 * smooth[0].sigma, "roughness must not be lost in the noise"
+
+
+def test_the_default_test_set_is_unchanged():
+    """DTFM-036's recorded baseline was measured on smooth cases. Turning
+    roughness on by default would silently invalidate every number in it.
+    """
+    prior = gen.Prior()
+
+    default = ev.make_cases(4, seed=0, prior=prior)
+    explicit = ev.make_cases(4, seed=0, prior=prior, roughness=False)
+
+    for a, b in zip(default, explicit, strict=True):
+        assert np.array_equal(a.observed, b.observed)
+
+
+def test_a_network_cannot_report_a_convergence_failure_it_cannot_have():
+    """A feed-forward pass does not fail to converge the way an iterative fit
+    does, so reporting it as always-converged would make the column meaningless
+    rather than favourable. What it *can* do is return something physically
+    impossible, and that is what the flag carries for a network.
+    """
+    prior = gen.Prior()
+    cases = ev.make_cases(4, seed=0, prior=prior)
+
+    report = ev.evaluate(cases, ev.network_estimator(_tiny_model(prior), prior=prior), prior=prior)
+
+    # margin defaults to 0, so the sigmoid cannot leave the prior at all
+    assert report.converged.all()
