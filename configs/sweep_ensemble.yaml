@@ -1,0 +1,50 @@
+# More ensemble members, for the calibration work — DTFM-047/048, §8.1.
+#
+#   gh workflow run sweep.yml --ref DTFM-048-ensemble-scaling \
+#       -f config=configs/sweep_ensemble.yaml -f runs=30
+#
+# 30 runs, about 6.1 hours of wall clock. Longest single job 3.7 hours against
+# the 6-hour per-job ceiling.
+#
+# WHAT THIS BUYS, AND WHAT IT DOES NOT. The open problem is calibration: sigma is
+# over-dispersed by roughly 2x on RMS and 3.5x at the median, and ensembling made
+# coverage worse rather than better (0.943 -> 0.995 within one sigma, against
+# 0.683 for a calibrated Gaussian). More members will NOT fix that. The
+# over-dispersion lives in the aleatoric head, and aleatoric already dominates
+# epistemic by 6.6x, so adding members moves the small term.
+#
+# What it does buy is the curve. DTFM-048 asks for a reliability diagram, and the
+# first question a reader asks of an ensemble result is how it depends on M.
+# Fifteen members per architecture supports M = 1, 2, 3, 5, 10, 15 by subsetting,
+# with the existing five reused rather than retrained -- so the answer arrives as
+# a curve with error bars rather than one point at M=5 and an assurance.
+#
+# BOTH ARCHITECTURES, because calibration may differ from accuracy. The CNN wins
+# on accuracy (0.489 against 0.589 nm of thickness, p = 0.00009) but is three
+# times less repeatable across seeds under MSE, and nothing yet says which
+# calibrates better. Guessing would be cheap here and wrong later.
+#
+# NOT SWEPT, deliberately: steps (NLL is flat by 24k, and 96k is the length every
+# recorded ensemble member used, so a different length would make the members
+# incomparable), lr (settled at 1e-3, and 3e-3 diverged on one seed in five),
+# lambda_recon (ablated over 75 runs, not separable from control at any weight).
+#
+# Seeds start at 5 because 0-4 already exist in the DTFM-070 artifacts. Retraining
+# them would cost 7 machine-hours to reproduce numbers already recorded.
+
+architecture: mlp
+width: 512
+channels: 64
+kernel: 7
+depth: 3
+batch: 256
+lr: 1.0e-3
+steps: 96000
+output_margin: 0.0
+checkpoint_every: 8000
+uncertainty: true
+lambda_recon: 0.0
+
+sweep:
+  architecture: [mlp, cnn]
+  seed: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
