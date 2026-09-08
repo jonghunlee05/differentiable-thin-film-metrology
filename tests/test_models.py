@@ -404,3 +404,113 @@ def test_an_untrained_head_admits_it_knows_nothing(architecture):
     _, sigma = model.predict(torch.randn(16, 400))
 
     assert sigma[:, 0].median() > 500.0, "an untrained head should claim near-total ignorance"
+
+
+# --- DTFM-047: the deep ensemble ----------------------------------------------
+
+
+def _members(count, prior, uncertainty=True):
+    made = []
+    for seed in range(count):
+        torch.manual_seed(seed)
+        made.append(
+            models.build_model(
+                {"architecture": "mlp", "width": 32, "depth": 1, "uncertainty": uncertainty},
+                prior=prior,
+            )
+        )
+    return made
+
+
+def test_the_two_uncertainties_add_in_quadrature():
+    """§8.1's formula, checked as an identity rather than trusted.
+
+    ``var = (1/M) Σ (σ̂² + θ̂²) − mean²`` splits exactly into the mean of the
+    members' variances plus the variance of their means. If the split did not
+    close, the two columns would not be two parts of one number and reporting
+    them separately would be meaningless.
+    """
+    prior = gen.Prior()
+    ensemble = models.Ensemble(_members(4, prior))
+
+    parts = ensemble.decompose(torch.randn(6, 400))
+
+    assert torch.allclose(
+        parts["total"] ** 2, parts["aleatoric"] ** 2 + parts["epistemic"] ** 2, atol=1e-6
+    )
+
+
+def test_identical_members_disagree_about_nothing():
+    """Epistemic uncertainty is disagreement. Five copies of one network have
+    none, and must report exactly zero rather than a small positive number —
+    a floating-point residue here would read as real model uncertainty.
+    """
+    prior = gen.Prior()
+    torch.manual_seed(0)
+    one = models.build_model(
+        {"architecture": "mlp", "width": 32, "depth": 1, "uncertainty": True}, prior=prior
+    )
+
+    parts = models.Ensemble([one, one, one]).decompose(torch.randn(4, 400))
+
+    assert torch.allclose(parts["epistemic"], torch.zeros_like(parts["epistemic"]), atol=1e-6)
+    assert torch.allclose(parts["total"], parts["aleatoric"], atol=1e-6)
+
+
+def test_different_seeds_do_disagree():
+    """The converse. Members trained from different seeds land in different
+    places, and that spread is the signal a single network cannot produce about
+    itself — a confidently wrong model has siblings that say otherwise.
+    """
+    prior = gen.Prior()
+    ensemble = models.Ensemble(_members(5, prior))
+
+    parts = ensemble.decompose(torch.randn(8, 400))
+
+    assert (parts["epistemic"] > 0).any()
+
+
+def test_an_ensemble_is_a_drop_in_for_a_single_model():
+    """``predict`` has the same signature, so DTFM-044's benchmark and DTFM-048's
+    calibration work talk to five networks without knowing it. A separate API
+    would mean a separate code path, and a separate code path is where the two
+    quietly stop being compared on the same terms.
+    """
+    prior = gen.Prior()
+    ensemble = models.Ensemble(_members(3, prior))
+    x = torch.randn(5, 400)
+
+    theta, sigma = ensemble.predict(x)
+
+    assert theta.shape == sigma.shape == (5, 3)
+    assert (sigma > 0).all()
+    assert torch.allclose(theta, ensemble.decompose(x)["mean"])
+
+
+def test_members_without_the_head_are_refused():
+    """An ensemble of heads-off models can report disagreement but not ambiguity.
+    §8.1 asks for both parts, and returning epistemic alone under the name
+    "uncertainty" would understate it on exactly the films that are genuinely
+    hard to measure.
+    """
+    prior = gen.Prior()
+    ensemble = models.Ensemble(_members(2, prior, uncertainty=False))
+
+    with pytest.raises(ValueError, match="uncertainty head"):
+        ensemble.decompose(torch.randn(3, 400))
+
+
+def test_an_empty_ensemble_is_refused():
+    with pytest.raises(ValueError, match="at least one"):
+        models.Ensemble([])
+
+
+def test_the_ensemble_estimate_is_the_mean_of_its_members():
+    prior = gen.Prior()
+    members = _members(4, prior)
+    x = torch.randn(6, 400)
+
+    mean = models.Ensemble(members).decompose(x)["mean"]
+
+    expected = torch.stack([m.predict(x)[0] for m in members]).mean(dim=0)
+    assert torch.allclose(mean, expected, atol=1e-6)

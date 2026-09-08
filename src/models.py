@@ -394,3 +394,104 @@ def build_model(config: dict | None = None, **overrides):
         settings["width"] = settings.get("width", 128)
         return InverseCNN(prior=prior, **settings)
     raise ValueError(f"unknown architecture {architecture!r}; expected 'mlp' or 'cnn'")
+
+
+@dataclass
+class Ensemble:
+    """§8.1's deep ensemble: ``M`` copies of the same architecture, different seeds.
+
+    The members disagree, and the disagreement is information. §8.1 splits the
+    total variance into two parts that mean different things:
+
+    .. code::
+
+        var = (1/M) Σ (σ̂_m² + θ̂_m²) − mean²
+            = (1/M) Σ σ̂_m²          ← aleatoric: the film is ambiguous
+            + (1/M) Σ θ̂_m² − mean²  ← epistemic: the models disagree
+
+    **Aleatoric** is what a single network's head already reports: this film is
+    genuinely hard to measure. A thicker film with a lower index makes nearly the
+    spectrum of a thinner one with a higher index, and no amount of training
+    removes that — DTFM-034's Cramér-Rao bound is the floor under it.
+
+    **Epistemic** is what one network cannot report about itself. An undertrained
+    or out-of-distribution model can be *confidently wrong*: it returns a small σ̂
+    and a badly wrong answer, and nothing in its own output contradicts it. Its
+    siblings, trained from different seeds, land somewhere else — and that spread
+    is the only signal that the first number should not be trusted.
+
+    The distinction is not academic here. Aleatoric error is irreducible and tells
+    you to measure the film differently; epistemic error tells you to train a
+    better model. Reporting only their sum would collapse two different actions
+    into one number.
+
+    Members are held rather than averaged into one network, because averaging
+    weights does not average predictions — two networks that reach the same loss
+    by different routes have no reason to have compatible weights.
+    """
+
+    members: list
+
+    def __post_init__(self) -> None:
+        if not self.members:
+            raise ValueError("an ensemble needs at least one member")
+        if any(m.scale_theta.span.shape != self.members[0].scale_theta.span.shape
+               for m in self.members):
+            raise ValueError("members must share a parameter space")
+
+    def __len__(self) -> int:
+        return len(self.members)
+
+    @property
+    def parameter_count(self) -> int:
+        return sum(m.parameter_count for m in self.members)
+
+    @property
+    def scale_theta(self) -> ParameterScaler:
+        return self.members[0].scale_theta
+
+    def decompose(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """``θ̂`` and the two variances, all in physical units.
+
+        Returns ``mean``, ``aleatoric``, ``epistemic`` and ``total`` — the last
+        three as standard deviations rather than variances, because that is what
+        a reader compares against an error in nanometres of thickness.
+        """
+        means, variances = [], []
+        for member in self.members:
+            member.eval()
+            with torch.no_grad():
+                theta, sigma = member.predict(x)
+            if sigma is None:
+                raise ValueError(
+                    "every member needs the uncertainty head: an ensemble without it "
+                    "can report disagreement but not ambiguity, and §8.1 asks for both"
+                )
+            means.append(theta)
+            variances.append(sigma**2)
+
+        stacked = torch.stack(means)
+        mean = stacked.mean(dim=0)
+        aleatoric = torch.stack(variances).mean(dim=0)
+        # Population variance over the members, matching §8.1's formula: the
+        # members ARE the distribution here, not a sample from a larger one.
+        epistemic = (stacked**2).mean(dim=0) - mean**2
+        # Floating point can drive a variance of zero slightly negative when every
+        # member agrees, which is exactly the case a square root must survive.
+        epistemic = epistemic.clamp(min=0.0)
+        return {
+            "mean": mean,
+            "aleatoric": aleatoric.sqrt(),
+            "epistemic": epistemic.sqrt(),
+            "total": (aleatoric + epistemic).sqrt(),
+        }
+
+    def predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(θ̂, σ̂)`` with σ̂ the *total* uncertainty, matching a single model's API.
+
+        Same signature as :meth:`InverseMLP.predict`, so an ensemble drops into
+        DTFM-044's benchmark and DTFM-048's calibration work without either
+        knowing it is talking to five networks.
+        """
+        parts = self.decompose(x)
+        return parts["mean"], parts["total"]
