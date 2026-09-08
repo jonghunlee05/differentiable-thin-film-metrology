@@ -125,9 +125,20 @@ class RunConfig:
         stem = f"{self.architecture}-{shape}-d{self.depth}-s{self.steps}"
         if self.uncertainty:
             stem += "-nll"
-        if self.lambda_recon:
-            # `g` so 0.1 is "0.1" rather than "0.100000", and 1e-3 stays short.
-            stem += f"-rec{self.lambda_recon:g}"
+        # Optimiser and output settings appear only when they differ from the
+        # default. That keeps the 216 runs already recorded matching a re-run of
+        # the same settings — renaming the default would make the whole history
+        # incomparable to everything measured afterwards — while still giving a
+        # sweep over any of them distinct names. `g` keeps 0.003 as "0.003"
+        # rather than "0.003000".
+        for prefix, value, default in (
+            ("lr", self.lr, 1.0e-3),
+            ("b", self.batch, 256),
+            ("m", self.output_margin, 0.0),
+            ("rec", self.lambda_recon, 0.0),
+        ):
+            if value != default:
+                stem += f"-{prefix}{value:g}"
         stem += f"-seed{self.seed}"
         return f"{self.label}-{stem}" if self.label else stem
 

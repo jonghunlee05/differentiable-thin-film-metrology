@@ -7,6 +7,7 @@ Implemented by DTFM-043.
 These pin that property, not the accuracy a run happens to reach.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -301,3 +302,73 @@ def test_the_physics_term_is_skipped_entirely_when_its_weight_is_zero(tmp_path):
 
     _, parts = record["loss_parts"][-1]
     assert "recon" not in parts
+
+
+# --- run naming, guarded as a property rather than case by case ---------------
+
+
+@pytest.mark.parametrize(
+    ("architecture", "field", "value"),
+    [
+        ("mlp", "width", 128),
+        ("mlp", "depth", 2),
+        ("mlp", "steps", 100),
+        ("mlp", "seed", 1),
+        ("mlp", "lr", 3.0e-3),
+        ("mlp", "batch", 64),
+        ("mlp", "output_margin", 0.2),
+        ("mlp", "uncertainty", True),
+        ("mlp", "lambda_recon", 1.0e-3),
+        ("cnn", "channels", 16),
+        ("cnn", "kernel", 5),
+        ("cnn", "depth", 2),
+        ("cnn", "lr", 3.0e-3),
+        ("cnn", "batch", 64),
+    ],
+)
+def test_every_field_that_changes_a_result_changes_the_run_name(architecture, field, value):
+    """The one property that keeps a sweep honest.
+
+    ``expand_sweep`` deduplicates on the name, so a result-affecting field
+    missing from it does not produce a confusing directory — it silently deletes
+    runs, and the deletion looks like agreement rather than loss.
+
+    This has now happened twice. DTFM-043: architectures ignoring each other's
+    fields turned eight runs into four. DTFM-042: ``lambda_recon`` was missing, so
+    an ablation over it would have collapsed to one run. Both were found by
+    accident. Enumerating the fields here turns the next one into a failing test
+    instead of a wasted night — ``lr``, ``batch`` and ``output_margin`` were all
+    missing when this was written, and a sweep over learning rate would have run
+    a third of the jobs it claimed to.
+
+    Add a row here whenever ``RunConfig`` gains a field that changes a result.
+    """
+    base = tr.RunConfig(architecture=architecture)
+    changed = dataclasses.replace(base, **{field: value})
+
+    assert changed.name != base.name, f"{field} does not appear in the run name"
+
+
+@pytest.mark.parametrize("field", ["checkpoint_every"])
+def test_fields_that_do_not_change_a_result_stay_out_of_the_name(field):
+    """The converse, so the rule above is not satisfied by naming everything.
+
+    How often a checkpoint is written changes what is on disk during a run, not
+    what the run produces. Putting it in the name would make two identical runs
+    look different and defeat the deduplication.
+    """
+    base = tr.RunConfig()
+
+    assert dataclasses.replace(base, **{field: 7}).name == base.name
+
+
+def test_an_architecture_ignoring_a_field_still_deduplicates():
+    """The behaviour that must survive the fix above.
+
+    An MLP does not read ``channels``. Two MLP runs differing only in it are the
+    same network trained twice from the same seed, and collapsing them is correct
+    — that is DTFM-043's dedup doing its job, not a naming gap.
+    """
+    assert tr.RunConfig(architecture="mlp", channels=16).name == (
+        tr.RunConfig(architecture="mlp", channels=64).name
+    )
