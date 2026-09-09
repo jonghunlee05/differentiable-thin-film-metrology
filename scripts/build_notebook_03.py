@@ -38,7 +38,7 @@ The short version is that the project spent two days tuning the wrong variable.
 | training 15× longer (8k → 120k steps) | ~5× |
 | **changing the loss** (MSE → Gaussian NLL) | **~2×, and convergence** |
 | architecture and learning rate | ~1.3× |
-| ensembling five seeds | ~1.33× |
+| ensembling twenty seeds | ~1.55× |
 
 Every number below was measured across **five seeds** unless it says otherwise.
 That is not caution for its own sake: this project twice believed a result that
@@ -381,27 +381,38 @@ print(f"  identity holds: {closes}")""")
 )
 
 cells.append(
-    md("""**Measured on the five trained seeds** (2000 unseen films):
+    md("""**Measured on twenty trained seeds** (2000 unseen films):
 
-| | |
-|---|---|
-| ensemble | **0.368 nm of thickness** — the project's best |
-| single members | 0.489 ± 0.022 |
-| aleatoric (median) | 1.806 |
-| epistemic (median) | 0.275 |
+| members | median error | aleatoric | epistemic | coverage within 1σ̂ | ECE |
+|---|---|---|---|---|---|
+| 1 | 0.442 | 0.595 | 0 | **0.655** | **0.0196** |
+| 5 | 0.330 | 0.589 | 0.226 | 0.833 | 0.1088 |
+| 20 | **0.285** | 0.595 | 0.257 | 0.851 | 0.1384 |
 
-Aleatoric dominates epistemic by **6.6×**: the models agree with each other far
-more than the films are ambiguous, so training more of the same will not help.
+nm of thickness. A calibrated Gaussian gives coverage 0.683.
 
-**And the calibration is not fixed.** Coverage within 1σ̂ goes from 0.943 for a
-single model to **0.995** for the ensemble, against 0.683 for a calibrated
-Gaussian — the total is aleatoric *plus* something, not a correction to it. The
-over-dispersion is real rather than a heavy-tail artefact: RMS σ̂ is 2.05× RMS
-error on the very measure NLL optimises.
+**A single model is calibrated.** ECE 0.0196, coverage 0.655 against a nominal
+0.683. Gaussian NLL does what the mathematics says it does.
 
-σ̂ is honest in *direction* — it correlates with the error at 0.809 — and wrong in
-*magnitude* by a factor of two to three. Fixing that is DTFM-048 to DTFM-050,
-which is where this project's headline claim gets decided.""")
+That sentence was wrong for three tickets. An earlier version of this notebook
+reported σ̂ as over-dispersed by two to three times, with coverage of 0.99. Both
+were artefacts of a clamp: `LOG_VAR_BOUNDS` had a lower bound corresponding to
+σ̂ = 1.806 nm of thickness, which is **5.6× above the error the models actually
+make**, so 93% of films came back with σ̂ welded to the floor — and the loss clamps
+too, so the head could not learn below it during training either.
+
+It was found because the aleatoric column read 1.806 for two different
+architectures and every ensemble size, to three decimals. Two independently
+trained networks do not agree to three decimals.
+
+**Ensembling still degrades calibration, and now for a real reason.** The
+ensemble's error falls from 0.442 to 0.285 while each member's aleatoric term
+stays at ~0.595 — every member states the uncertainty appropriate to *its own*
+accuracy, not the mean's — and epistemic adds on top rather than instead. §8.1's
+formula estimates the spread of the mixture predictive distribution, which is a
+different quantity from the error of the mixture's mean, and the two diverge as M
+grows. A single fitted scale factor of 0.56 takes the twenty-member ECE from
+0.1384 to 0.0380.""")
 )
 
 # --- 8. honest close --------------------------------------------------------
@@ -409,11 +420,11 @@ cells.append(
     md("""## 8. Where this leaves the project
 
 ```
-0.368 nm of thickness   ensemble of five CNNs, 96,000 steps, NLL
+0.285 nm of thickness   ensemble of twenty CNNs, 96,000 steps, NLL
 0.034                   classical fit, when its model is right
 ```
 
-**A factor of 11 apart** — down from 176× three days ago.
+**A factor of 8.4 apart** — down from 176× four days ago.
 
 The remaining gap is not a physics limit. DTFM-034's Cramér–Rao bound says the
 information is present in the spectrum, and the classical fit extracts nearly all
@@ -422,8 +433,9 @@ which is the better kind to have.
 
 **What is honestly still open:**
 
-- σ̂ is over-dispersed 2–3×, so *calibrated uncertainty* — the project's headline
-  claim — is not yet demonstrated. DTFM-048–050.
+- A *single* model's σ̂ is calibrated (ECE 0.0196), which is the project's headline
+  claim demonstrated for the first time. The **ensemble's** is not, and needs a
+  fitted correction on held-out data — DTFM-050/051.
 - Everything here is **in-distribution**: films drawn from the prior the network
   trained on. DTFM-053/054 probe outside it, and those numbers will be worse.
 - The thick regime carries most of the error, 1.9–2.5 nm of thickness with 70–90%
