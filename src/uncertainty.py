@@ -403,3 +403,95 @@ def sweep_thickness(
         "condition": condition,
         "rank": rank,
     }
+
+
+def batched_jacobian(
+    parameters: torch.Tensor,
+    wavelengths_nm: NDArray,
+    measurement: gen.Measurement,
+    substrate: torch.Tensor,
+) -> torch.Tensor:
+    """``J[f, i, k] = ∂observable_f(λ_i) / ∂θ_k`` for every film at once.
+
+    **Forward-mode, and the choice is what makes DTFM-050 practical.** The
+    per-film :func:`baseline.model_jacobian` takes 383 ms, so 2000 films is
+    thirteen minutes — enough that the analysis would have to be shipped to a
+    runner rather than run while thinking.
+
+    Reverse mode does not help: it costs one pass per *output*, and there are 400.
+    ``vmap`` over the per-film version fails outright, because the branch-cut
+    selection inside the transfer matrix is data-dependent control flow. But the
+    Jacobian has only **three columns**, one per parameter, and forward mode costs
+    one pass per *input* — so three batched passes give the whole thing, for every
+    film simultaneously. 2.35 ms per film, a factor of 163, and it agrees with the
+    per-film reference to 1e-9.
+    """
+    grid = torch.as_tensor(np.asarray(wavelengths_nm, dtype=float))[None, :]
+    substrate_row = substrate[None, :] if substrate.dim() == 1 else substrate
+
+    def observable(theta: torch.Tensor) -> torch.Tensor:
+        index = dp.cauchy_n((theta[:, 1:2], theta[:, 2:3], torch.zeros(())), grid)
+        psi, delta = pt.stack_psi_delta(
+            grid, [theta[:, 0:1]], [torch.ones(()), index, substrate_row], measurement.angle_rad
+        )
+        return torch.cat([psi, delta], dim=1)
+
+    columns = []
+    for k in range(parameters.shape[1]):
+        tangent = torch.zeros_like(parameters)
+        tangent[:, k] = 1.0
+        _, column = torch.func.jvp(observable, (parameters,), (tangent,))
+        columns.append(column)
+    return torch.stack(columns, dim=-1)
+
+
+def bound_per_film(
+    parameters: NDArray,
+    wavelengths_nm: NDArray,
+    *,
+    measurement: gen.Measurement | None = None,
+    prior: gen.Prior | None = None,
+    sigma: float | None = None,
+    substrate: torch.Tensor | None = None,
+) -> NDArray[np.float64]:
+    """The Cramér-Rao floor on thickness, one value per film — DTFM-050.
+
+    ``parameters`` is ``(films, 3)`` of true ``(thickness, A, B)``. Returns the
+    square root of ``C[0, 0]`` for each: the smallest standard deviation any
+    **unbiased** estimator of that film's thickness could have, given this
+    instrument and this noise level.
+
+    That word carries the whole caveat, and §8.2's comparison is worth nothing
+    without it. The bound constrains unbiased estimators. A network whose output
+    passes through a sigmoid onto the prior is *bounded*, therefore biased, and a
+    biased estimator is permitted a smaller variance than the bound — it buys the
+    reduction with an error it cannot see. So a σ̂ below the floor is not proof of
+    a physical impossibility; it is proof that **one** of two uncomfortable things
+    holds: the estimator is trading bias for variance, or it is over-confident.
+
+    Evaluated at the *true* parameters rather than at the estimate. The bound is a
+    property of the measurement, not of any method's answer, and computing it at
+    the estimate would let a badly wrong estimate quietly move its own floor.
+    """
+    measurement = measurement or gen.Measurement()
+    prior = prior or gen.Prior()
+    sigma = measurement.ellipsometer_sigma_rad if sigma is None else sigma
+    parameters = np.atleast_2d(np.asarray(parameters, dtype=float))
+    if substrate is None:
+        n, k = dp.load_nk(prior.substrate, wavelengths_nm)
+        substrate = torch.tensor(n + 1j * k)
+
+    jacobians = batched_jacobian(
+        torch.as_tensor(parameters), wavelengths_nm, measurement, substrate
+    ).numpy()
+
+    floors = np.empty(len(parameters))
+    for i, jacobian in enumerate(jacobians):
+        covariance, rank = cramer_rao_bound(jacobian, sigma)
+        # A rank-deficient Fisher matrix means some direction of parameter space
+        # is unconstrained by the measurement, and the flooring inside
+        # `cramer_rao_bound` has substituted a large finite variance for an
+        # infinite one. Reported as NaN rather than as that substitute: a huge
+        # bound and an undefined bound are different claims.
+        floors[i] = np.sqrt(covariance[0, 0]) if rank == covariance.shape[0] else np.nan
+    return floors
