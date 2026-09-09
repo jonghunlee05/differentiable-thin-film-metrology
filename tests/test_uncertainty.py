@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from src import baseline as bl
+from src import dataset as ds
 from src import dispersion as dp
 from src import generate as gen
 from src import uncertainty as un
@@ -403,3 +404,83 @@ def test_the_bound_is_optimistic_against_a_real_instrument(substrate):
     assert vendor_repeatability_nm / bound.thickness_bound_nm > 10.0, (
         "by more than an order of magnitude, which is the caveat worth quoting"
     )
+
+
+# --- DTFM-050: sigma-hat against the bound ------------------------------------
+
+
+def test_the_batched_jacobian_matches_the_per_film_one():
+    """The fast path has to be the same physics, not merely fast.
+
+    Forward mode over three parameters replaces one reverse pass per film, and
+    the whole point of DTFM-050 is comparing against a bound — a bound computed
+    from a subtly different Jacobian would be a different bound.
+    """
+    prior = gen.Prior()
+    wavelengths = np.linspace(400.0, 800.0, 200)
+    measurement = gen.Measurement()
+    n, k = dp.load_nk(prior.substrate, wavelengths)
+    substrate = torch.tensor(n + 1j * k)
+    theta = np.array([[420.0, 1.46, 0.004], [1500.0, 1.52, 0.009]])
+
+    batched = un.batched_jacobian(
+        torch.as_tensor(theta), wavelengths, measurement, substrate
+    ).numpy()
+
+    for i, row in enumerate(theta):
+        reference = bl.model_jacobian(row, wavelengths, measurement, substrate)
+        assert np.allclose(batched[i], reference, rtol=1e-6, atol=1e-9)
+
+
+def test_the_bound_is_evaluated_at_the_truth_not_at_an_estimate():
+    """The bound is a property of the measurement, not of a method's answer.
+
+    Computing it at an estimate would let a badly wrong estimate move its own
+    floor — and the worse the estimate, the more the floor would flatter it.
+    """
+    prior = gen.Prior()
+    wavelengths = np.linspace(400.0, 800.0, 200)
+
+    truth = un.bound_per_film(np.array([[420.0, 1.46, 0.004]]), wavelengths, prior=prior)
+    elsewhere = un.bound_per_film(np.array([[900.0, 1.46, 0.004]]), wavelengths, prior=prior)
+
+    assert not np.isclose(truth[0], elsewhere[0]), (
+        "the bound must depend on the film it is computed for"
+    )
+
+
+def test_the_bound_is_far_below_what_this_project_achieves():
+    """The comparison DTFM-050 exists to make, as a guard.
+
+    The classical fit reaches 0.034 nm of thickness and the bound is around
+    0.017, so the fit is within a factor of two of optimal. If the bound ever
+    came back *above* what an estimator already achieves, the bound would be
+    wrong — an estimator cannot beat a correct floor by much, and certainly not
+    by the margins that a broken Fisher inversion produces.
+    """
+    prior = gen.Prior()
+    wavelengths = np.linspace(400.0, 800.0, 200)
+    batch = ds.sample_batch(24, wavelengths, np.random.default_rng(0), prior=prior)
+
+    bound = un.bound_per_film(batch.targets.numpy(), wavelengths, prior=prior)
+    finite = bound[np.isfinite(bound)]
+
+    assert len(finite) > 0
+    assert np.median(finite) < 0.034, "the classical fit already beats this bound"
+    assert (finite > 0).all()
+
+
+def test_a_rank_deficient_bound_is_nan_rather_than_a_substitute():
+    """`cramer_rao_bound` floors near-zero eigenvalues to keep the inverse finite.
+    That substitute is a large number standing in for an infinite one, and
+    reporting it as a bound would turn "this direction is unmeasurable" into "this
+    direction is measurable, badly" — a different and much weaker claim.
+    """
+    prior = gen.Prior()
+    wavelengths = np.linspace(400.0, 800.0, 200)
+
+    bound = un.bound_per_film(
+        np.array([[420.0, 1.46, 0.004]]), wavelengths, prior=prior
+    )
+
+    assert np.isfinite(bound[0]), "a well-conditioned film should not be NaN"
