@@ -56,12 +56,13 @@ These were argued out already. Reopening them costs time and changes nothing.
 | **No novelty claimed on speed** | Would be immediately corrected by anyone in the field. §3a |
 | **MLP and 1D CNN only** | Architecture novelty is not what is being assessed. A transformer here signals inexperience, not ambition. §7.2 |
 | **Baseline before network, always** | An accuracy number with nothing to compare against is meaningless, and benchmarking against baselines is explicitly requested by the target roles. |
+| **Finish rather than fork (week 7½)** | Decided at DTFM-052. Week 7 arrived in 5 days against a 10-week plan, so the fork was genuinely open — and declined anyway. The remaining work is DTFM-053 → 063. §12 |
 | **Ellipsometry (Ψ, Δ), at oblique incidence** | Adopted at DTFM-028 on measured evidence: 5–100× better thickness precision, and the largest gains in the thin-film regime the project is written about. Requires ~70° incidence, so it **replaces** the earlier near-normal reflectance scope rather than extending it. §3 |
 
 ### Open decisions
 
 - ~~Ellipsometry (Ψ, Δ) — decide by week 3.~~ **Decided at DTFM-028: adopted.** See the standing decisions above and §3.
-- **The week 7½ fork** — finish the safe version, or push at an open question. Decide with real information about pace, not in advance. §12
+- ~~**The week 7½ fork** — finish the safe version, or push at an open question.~~ **Decided at DTFM-052: stop and finish.** See below.
 
 ### Status
 
@@ -554,6 +555,44 @@ README opening with the calibration figure and three sentences. Package structur
 **Ships:** the repository as a portfolio object.
 
 ---
+
+### Decided at DTFM-052: stop and finish
+
+**The condition the fork was gated on was met, and the fork was declined anyway.**
+
+§12 says to take the fork *only if week 7 arrived early*. It arrived in **5 days
+against a 10-week plan** — E1 through E6 complete, including the calibration figure
+§12 calls the strongest result in the project. So the option was real.
+
+**Why it was declined.** At the moment of deciding, the repository had no README, no
+report, and no figure regeneration path. Five days of results — 271 training runs, the
+loss finding, the Cramér–Rao comparison, the calibration figure — existed only inside
+pull request descriptions. Someone landing on the repository saw a one-line
+description and a file tree.
+
+That is the actual risk, and it is not the one the fork protects against. An extra
+experiment adds a result to a project nobody can read; the finishing work makes five
+days of results legible. §12's own guidance — *a finished ordinary project beats an
+unfinished ambitious one* — points the same way, and "ordinary" undersells what E1–E6
+already produced.
+
+**What was given up, stated so the choice can be judged.** DTFM-067's question is
+half-answered already: DTFM-044 measured the classical fit as 34× better than the
+network on films its model describes exactly, and 1.4× worse on films carrying
+roughness it cannot fit. Mapping that surface systematically — roughness, interfacial
+oxide, non-uniformity, wavelength-calibration error — would be a genuinely novel
+result and the groundwork exists. It is deferred, not abandoned, and DTFM-054's
+out-of-distribution probes cover the nearest part of it.
+
+DTFM-066's normalizing-flow posterior was also declined, and on evidence rather than
+cost: DTFM-051 measured the network's errors as **unimodal**, with the largest error
+anywhere 37 nm of thickness against the ~200 nm a fringe-order jump would produce. The
+Gaussian head's inability to represent a bimodal posterior is a real limitation that
+is not currently binding. Fixing a latent limitation ahead of an active one is the
+wrong order.
+
+**The remaining path:** DTFM-053 → 063. Failure atlas, hybrid, README, report,
+reproducibility audit, definition-of-done review.
 
 ## 13. Repository structure
 
