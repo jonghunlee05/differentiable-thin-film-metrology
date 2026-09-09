@@ -1,0 +1,55 @@
+# Retrain the ensemble with a sigma floor that does not bind — DTFM-041 fix,
+# and the input to DTFM-048 through DTFM-050.
+#
+#   gh workflow run sweep.yml --ref DTFM-041-fix-log-var-floor \
+#       -f config=configs/sweep_calibration.yaml -f runs=20
+#
+# 20 runs, about 3.7 hours of wall clock -- all twenty start at once, so the wall
+# clock is one job. Longest job 3.7 hours against the 6-hour per-job ceiling.
+#
+# WHY THESE MODELS MUST BE RETRAINED. LOG_VAR_BOUNDS had a lower bound of -14,
+# which is a sigma of 1.806 nm of thickness. The trained models reach a median
+# error of 0.32 nm of thickness, so the floor sat 5.6x ABOVE the error they make
+# and 93% of films came back with sigma welded to it. The loss clamps as well, so
+# the gradient there is zero and the head could not learn below the floor during
+# training either.
+#
+# That makes every calibration number measured so far a property of a constant
+# rather than of Gaussian NLL: the "sigma is over-dispersed 2-3x" finding, the
+# 0.99 coverage, the claim that ensembling worsens calibration. None of it can be
+# trusted, and none of it can be rescued by re-analysis, because the models
+# themselves were trained against the wrong bound.
+#
+# The floor is now -25, a sigma of 0.0074 nm of thickness -- five times below what
+# the classical fit achieves and far below DTFM-034's Cramer-Rao bound, so it
+# cannot bind on any film the physics permits. Every run now also reports
+# `sigma_saturated`, so a binding clamp appears as a number in the record instead
+# of waiting to be spotted in a column of repeated decimals.
+#
+# CNN ONLY, twenty seeds. The ensemble curve measured yesterday is unambiguous:
+# the CNN improves 1.6x from one member to twenty (0.517 -> 0.320 nm of
+# thickness) and is still improving, while the MLP plateaus by ten members at
+# 1.2x (0.603 -> 0.493). Twenty CNN members is what DTFM-048's reliability
+# diagram needs, and spending half the night on the architecture that plateaus
+# would buy a worse curve for the same hours. The MLP comparison is worth
+# redoing, after the calibration question is settled on the better model.
+#
+# Everything else is held at the settled values: 96,000 steps (NLL is flat by
+# 24k), lr 1e-3 (3e-3 diverged on one seed in five), lambda_recon 0 (ablated over
+# 75 runs, not separable from control at any weight).
+
+architecture: cnn
+channels: 64
+kernel: 7
+depth: 3
+width: 512
+batch: 256
+lr: 1.0e-3
+steps: 96000
+output_margin: 0.0
+checkpoint_every: 8000
+uncertainty: true
+lambda_recon: 0.0
+
+sweep:
+  seed: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
