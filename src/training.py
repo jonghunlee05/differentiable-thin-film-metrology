@@ -248,6 +248,10 @@ def evaluate(model, prior, wavelengths_nm, films: int = 2000, seed: int = 999) -
         # `predicted[:, 0]` would then silently index the first *parameter of the
         # tuple* rather than the thickness.
         predicted, sigma = model.predict(batch.observed.float())
+        raw = model(batch.observed.float())
+        saturation = (
+            models.saturated_fraction(raw[1]) if isinstance(raw, tuple) else None
+        )
     error = (predicted[:, 0] - batch.targets[:, 0]).numpy()
     truth = batch.targets[:, 0].numpy()
 
@@ -266,6 +270,12 @@ def evaluate(model, prior, wavelengths_nm, films: int = 2000, seed: int = 999) -
         # enough to tell a trained head from an untrained one at a glance.
         sigma_nm = sigma[:, 0].numpy()
         report |= {
+            # How often the head ran out of room. A bound that binds makes every
+            # calibration number a property of the bound: DTFM-041 shipped a floor
+            # of 1.806 nm of thickness against models that err by 0.32, and 93% of
+            # films came back pinned to it. Reported so the next one is a number
+            # in the record rather than something to notice later.
+            "sigma_saturated": saturation,
             "sigma_median_nm": float(np.median(sigma_nm)),
             "sigma_error_correlation": float(
                 np.corrcoef(sigma_nm, np.abs(error))[0, 1]

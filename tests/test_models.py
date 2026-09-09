@@ -514,3 +514,58 @@ def test_the_ensemble_estimate_is_the_mean_of_its_members():
 
     expected = torch.stack([m.predict(x)[0] for m in members]).mean(dim=0)
     assert torch.allclose(mean, expected, atol=1e-6)
+
+
+# --- DTFM-041, corrected: the bound must not bind ------------------------------
+
+
+def test_the_uncertainty_floor_is_below_any_error_the_project_can_reach():
+    """The bug this constant shipped with, expressed as the test that would have
+    caught it.
+
+    The floor was −14, which is σ̂ = 1.806 nm of thickness. The trained models
+    reach a median error of 0.32 nm of thickness, so the floor sat 5.6× *above*
+    the error they actually make and 93% of films came back welded to it. The
+    loss clamps too, so the head could not learn its way below it during training
+    either — and every calibration number measured under it described the
+    constant rather than the loss.
+
+    A σ̂ floor has to be unreachable to be harmless. This one is now below what
+    the *classical* fit achieves (0.034 nm of thickness), which is itself close
+    to DTFM-034's Cramér-Rao bound — so no estimator this project can build will
+    ever be squeezed by it.
+    """
+    scaler = models.ParameterScaler(gen.Prior())
+    low, _ = models.LOG_VAR_BOUNDS
+
+    floor_nm = float(np.exp(0.5 * low) * scaler.span[0])
+
+    assert floor_nm < 0.034, (
+        f"the sigma floor is {floor_nm:.4f} nm of thickness, which the classical "
+        "baseline already beats — it will bind on a good model"
+    )
+
+
+def test_saturation_is_measurable():
+    """Clamping was chosen over a smooth squashing because a hard bound is
+    *visible*. That visibility went unused for three tickets, so it is now a
+    function with a number attached.
+    """
+    low, high = models.LOG_VAR_BOUNDS
+    pinned = torch.tensor([[low, high, 0.0]])
+
+    assert models.saturated_fraction(pinned) == pytest.approx(2 / 3)
+    assert models.saturated_fraction(torch.zeros(4, 3)) == 0.0
+
+
+def test_a_healthy_head_does_not_sit_on_the_bounds():
+    """At initialisation the head outputs near zero, which is nowhere near either
+    bound. If a fresh model were already saturated the bounds would be wrong
+    before training even started.
+    """
+    torch.manual_seed(0)
+    model = models.build_model({"uncertainty": True}, prior=gen.Prior())
+
+    _, log_var = model(torch.randn(32, 400))
+
+    assert models.saturated_fraction(log_var) == 0.0

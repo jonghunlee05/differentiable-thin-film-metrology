@@ -155,17 +155,46 @@ class ParameterScaler:
 #:
 #: The Gaussian NLL contains ``(θ̂ − θ)² / σ̂²``. Nothing in that expression stops
 #: the network from driving ``log σ̂²`` towards −∞ on films it happens to fit well
-#: early in training: doing so makes the first term enormous but the gradient
-#: points that way locally, and the run dies with a NaN rather than converging.
-#: The upper bound matters less but is not free either — an unbounded σ̂ lets the
-#: network answer "I have no idea" everywhere, which minimises the loss while
-#: predicting nothing.
+#: early in training: the local gradient points that way, σ̂² underflows, and the
+#: run ends in a NaN rather than converging. These bounds are that backstop.
 #:
-#: The range below is generous rather than tuned. In cube units the whole
-#: parameter space is 1 wide, so σ̂ = 1 is total ignorance; the bounds correspond
-#: to roughly 0.9e-3 to 20 in cube units, or about 1.8 nm to well past the prior
-#: for thickness. It exists to keep the arithmetic finite, not to encode a belief.
-LOG_VAR_BOUNDS = (-14.0, 6.0)
+#: **The lower bound was −14 and that was wrong.** It corresponds to σ̂ = 1.806 nm
+#: of thickness, which was described in this file as generous. It is not: the
+#: trained models reach a median error of 0.32 nm of thickness, so the floor sat
+#: **5.6× above the error they actually make**, and 93% of films came back with σ̂
+#: welded to it. The loss clamps too, so the gradient there is zero and the head
+#: could not learn its way below the bound during training either. Every
+#: calibration number measured before this — the "σ̂ is over-dispersed 2-3×"
+#: finding, the 0.99 coverage — was a property of this constant rather than of
+#: Gaussian NLL.
+#:
+#: −25 is σ̂ ≈ 0.0074 nm of thickness: five times below what the *classical* fit
+#: achieves and far below DTFM-034's Cramér-Rao bound, so it cannot bind on any
+#: film the physics permits. The upper bound is untouched and corresponds to
+#: σ̂ ≈ 39,800 nm of thickness, twenty times the prior's whole width.
+#:
+#: A bound chosen by eye needs a measurement behind it, which is what
+#: :func:`saturated_fraction` is for — it is reported in every run record, so a
+#: binding clamp shows up as a number rather than waiting to be noticed in a
+#: column of repeated decimals.
+LOG_VAR_BOUNDS = (-25.0, 6.0)
+
+
+def saturated_fraction(log_var: torch.Tensor) -> float:
+    """Fraction of outputs sitting on either bound — a head that has run out of room.
+
+    This exists because the previous bound was found by accident. The aleatoric
+    column of an ensemble table read 1.806 for every architecture and every
+    ensemble size, to three decimals, and only then did anyone ask why. The
+    saturation was visible from the start and nothing was looking at it.
+
+    Clamping rather than a smooth squashing was justified in this file on exactly
+    that ground — that a hard bound is *visible* — and the visibility was never
+    used. It is now measured on every evaluation.
+    """
+    low, high = LOG_VAR_BOUNDS
+    hit = (log_var <= low) | (log_var >= high)
+    return float(hit.float().mean())
 
 
 def clamp_log_var(log_var: torch.Tensor) -> torch.Tensor:
