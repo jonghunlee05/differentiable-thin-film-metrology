@@ -16,6 +16,8 @@ figures/*
 # broken link, and the figure IS the deliverable — §16 asks the README to open
 # with it. Regenerate with scripts/calibration_figure.py.
 !figures/calibration_headline.png
+!figures/what_this_is.png
+!figures/degeneracy.png
 !figures/.gitkeep
 # Generated data is excluded by its contents rather than by the directory: git
 # cannot re-include anything beneath an excluded directory, and the vendored
