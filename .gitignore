@@ -11,6 +11,11 @@ Implementation-Notes.md
 
 # generated output — the point is that it regenerates (spec §15)
 figures/*
+# ...except the one figure the README opens with. Generated output stays out of
+# the repository (§15), but a README whose headline image is gitignored renders a
+# broken link, and the figure IS the deliverable — §16 asks the README to open
+# with it. Regenerate with scripts/calibration_figure.py.
+!figures/calibration_headline.png
 !figures/.gitkeep
 # Generated data is excluded by its contents rather than by the directory: git
 # cannot re-include anything beneath an excluded directory, and the vendored
