@@ -3,6 +3,27 @@
 Measuring how thick a film is from the light it reflects — and working out when
 that measurement should not be trusted.
 
+## What the problem is
+
+![What this is](figures/what_this_is.png)
+
+Shine light at a transparent film and it reflects twice — once off the top
+surface, once off the film–substrate boundary underneath. Those two reflections
+interfere, and how they add up depends on how far the second one travelled. So
+the pattern of colours coming back carries the film's thickness inside it.
+
+Reading the thickness back out is the hard direction. **Panel 3 is the whole
+difficulty in one picture:** a 25.00 nm film and a 24.72 nm film made of slightly
+different material produce spectra 0.51 mrad apart — *half* the instrument's own
+noise. No method can separate them, so the honest answer is not a thickness but a
+thickness and a spread.
+
+That is what this project measures: not just how thick, but how sure.
+
+---
+
+## The result
+
 ![The headline result](figures/calibration_headline.png)
 
 **A neural network inverts spectroscopic ellipsometry about 9,000× faster than a
@@ -40,11 +61,18 @@ ceiling, where the output sigmoid saturates.
 
 ## Why this is not just a regression problem
 
+![Where the degeneracy bites](figures/degeneracy.png)
+
 Given a film's parameters, computing the spectrum is exact and cheap. Going
-backwards is neither. A thicker film with a lower refractive index produces
-almost the same spectrum as a thinner film with a higher one — DTFM-034 measured
-that correlation above 0.99 past 700 nm of thickness — so some films are genuinely
-ambiguous no matter how good the method is.
+backwards is neither. Thickness and refractive index trade off against each
+other, and below about **21 nm of thickness** they stop being separable at all —
+the correlation between them exceeds 0.99, and at 1 nm the uncertainty floor is
+**37% of the film**. That threshold, `d/λ ≈ 0.035`, is where the measurement
+itself gives out; no algorithm recovers what is not there.
+
+The right-hand panel is the honest scorecard: the network's error tracks the
+physical floor's shape but sits far above it, and its stated uncertainty follows
+— though it under-reacts to the thin regime by about a factor of two.
 
 That is why the uncertainty matters more than the accuracy. A thickness is
 useful; a thickness that knows when it is guessing is what a fab can act on.
