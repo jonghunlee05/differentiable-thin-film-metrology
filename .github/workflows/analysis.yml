@@ -1,0 +1,58 @@
+# Analysis jobs, on GitHub's hardware rather than a laptop.
+#
+#   gh workflow run analysis.yml -f script=scripts/degeneracy_probe.py
+#   gh workflow run analysis.yml -f script=scripts/degeneracy_probe.py \
+#       -f args="--classical-points 24"
+#
+# Separate from sweep.yml because the shape of the work is different. A sweep is
+# many independent training runs across a matrix; an analysis is one script that
+# needs the whole picture at once. Trying to express one as the other would mean
+# either a matrix of size one or a script that cannot see its own results.
+#
+# WHY THIS EXISTS AT ALL. Most analysis in this project is seconds of arithmetic
+# on cached predictions and belongs on whatever machine is asking the question.
+# The exception is anything that calls the classical fitter: a multi-start
+# Levenberg-Marquardt inversion is about 16 seconds per film, so a probe across
+# two dozen thicknesses is six minutes of a pegged core, and DTFM-054 and
+# DTFM-055 both need more of the same. That is what runners are for.
+
+name: Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Script to run, e.g. scripts/degeneracy_probe.py"
+        required: true
+      args:
+        description: "Extra arguments passed through verbatim"
+        default: ""
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330        # under the 6-hour job ceiling, with margin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install CPU-only torch
+        run: pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e .
+
+      - name: Run
+        run: python "${{ inputs.script }}" ${{ inputs.args }}
+
+      # figures/ and runs/ are gitignored, so an artifact is how a result leaves
+      # the machine that produced it — the same reasoning as sweep.yml.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analysis
+          path: |
+            figures/
+            runs/
+          retention-days: 90
+          if-no-files-found: warn
